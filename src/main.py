@@ -14,6 +14,7 @@ if __name__ == '__main__':
         'reg_weight': [0.001],
         'learning_rate': [0.003],
         'gpu_id': args.gpu_id,
+        'fusion': 'add'
     }
 
 

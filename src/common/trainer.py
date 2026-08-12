@@ -82,6 +82,12 @@ class Trainer(AbstractTrainer):
         self.train_loss_dict = dict()
         self.optimizer = self._build_optimizer()
 
+        checkpoint_dir = config['checkpoint_dir'] or 'saved'
+        self.checkpoint_dir = os.path.abspath(
+            os.path.expanduser(str(checkpoint_dir))
+        )
+        self.saved_model_file = self._build_saved_model_file()
+
         #fac = lambda epoch: 0.96 ** (epoch / 50)
         lr_scheduler = config['learning_rate_scheduler']        # check zero?
         fac = lambda epoch: lr_scheduler[0] ** (epoch / lr_scheduler[1])
@@ -112,6 +118,62 @@ class Trainer(AbstractTrainer):
             self.logger.warning('Received unrecognized optimizer, set default Adam optimizer')
             optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         return optimizer
+
+    @staticmethod
+    def _safe_filename_part(value):
+        """Return a filesystem-friendly representation of a config value."""
+        value = str(value)
+        return ''.join(
+            character if character.isalnum() or character in ('-', '_') else '-'
+            for character in value
+        )
+
+    def _build_saved_model_file(self):
+        """Build a unique checkpoint filename for this hyperparameter run."""
+        model_name = self._safe_filename_part(self.config['model'])
+        dataset_name = self._safe_filename_part(self.config['dataset'])
+        seed = self._safe_filename_part(self.config['seed'])
+        timestamp = get_local_time()
+        filename = '{}-{}-seed{}-{}.pth'.format(
+            model_name,
+            dataset_name,
+            seed,
+            timestamp
+        )
+        checkpoint_path = os.path.join(self.checkpoint_dir, filename)
+
+        # Hyperparameter runs can start within the same second. Avoid replacing
+        # a checkpoint produced by an earlier run.
+        suffix = 1
+        while os.path.exists(checkpoint_path):
+            filename = '{}-{}-seed{}-{}-{}.pth'.format(
+                model_name,
+                dataset_name,
+                seed,
+                timestamp,
+                suffix
+            )
+            checkpoint_path = os.path.join(self.checkpoint_dir, filename)
+            suffix += 1
+        return checkpoint_path
+
+    def _save_checkpoint(self):
+        """Atomically save only the model parameters needed for reuse."""
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        parameter_state = {
+            name: parameter.detach()
+            for name, parameter in self.model.named_parameters()
+        }
+        checkpoint = {'state_dict': parameter_state}
+
+        temporary_file = self.saved_model_file + '.tmp'
+        torch.save(checkpoint, temporary_file)
+        os.replace(temporary_file, self.saved_model_file)
+        self.logger.info(
+            'Saved best model checkpoint to: {}'.format(
+                self.saved_model_file
+            )
+        )
 
     def _train_epoch(self, train_data, epoch_idx, loss_func=None):
         r"""Train the model in an epoch
@@ -234,6 +296,8 @@ class Trainer(AbstractTrainer):
                         self.logger.info(update_output)
                     self.best_valid_result = valid_result
                     self.best_test_upon_valid = test_result
+                    if saved:
+                        self._save_checkpoint()
 
                 if stop_flag:
                     stop_output = '+++++Finished training, best eval result in epoch %d' % \

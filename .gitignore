@@ -1,4 +1,6 @@
-/data
+# /data
+/saved
+/log
 *.pyc
 *.log
 text2.out

@@ -19,9 +19,9 @@ from common.init import xavier_uniform_initialization
 from torch.nn import MultiheadAttention
 # from .transformer import TransformerEncoder
 
-class GLORIA(GeneralRecommender):
+class LIGHTGCN(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(GLORIA, self).__init__(config, dataset)
+        super(LIGHTGCN, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
@@ -29,7 +29,7 @@ class GLORIA(GeneralRecommender):
         
         batch_size = config['train_batch_size']         # not used
         dim_x = config['embedding_size']
-        self.feat_embed_dim = config['feat_embed_dim']
+        self.feat_embed_dim = config['feat_embed_dim'] * 2
         self.n_layers = config['n_mm_layers']
         self.knn_k = config['knn_k']
 
@@ -52,8 +52,10 @@ class GLORIA(GeneralRecommender):
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
-        self.id_embedding_low = nn.Embedding(num_item, self.feat_embed_dim)
-        self.id_embedding_high = nn.Embedding(num_item, self.feat_embed_dim)
+        # self.id_embedding_low = nn.Embedding(num_item, self.feat_embed_dim)
+        # self.id_embedding_high = nn.Embedding(num_item, self.feat_embed_dim)
+
+        self.id_embedding = nn.Embedding(num_item, self.feat_embed_dim)
 
         self.mlp_item = nn.Linear(self.t_feat.shape[-1], self.dim_latent, bias=False)
         self.mlp_user = nn.Linear(self.user_feat.shape[-1], self.dim_latent, bias=False)
@@ -62,52 +64,63 @@ class GLORIA(GeneralRecommender):
         self.mm_adj = text_adj
 
         train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
-        edge_index = self.pack_edge_index(train_interactions)
+        # self.edge_index = self.pack_edge_index(train_interactions)
+        forward_edges_np = self.pack_edge_index(train_interactions)
+        forward_edges = torch.tensor(
+            forward_edges_np,
+            dtype=torch.long
+        ).t().contiguous()
+        reverse_edges = forward_edges[[1, 0], :]
 
-        item_ids = edge_index[:, 1] - self.num_user
-        item_degree = np.bincount(item_ids, minlength=self.num_item)
-
-        high_ratio = 0.10
-        num_high = int(self.num_item * high_ratio)
-
-        high_items = np.argsort(item_degree)[-num_high:]
-        high_items = set(high_items.tolist())
-
-        low_edges = []
-        high_edges = []
-
-        for edge in edge_index:
-            item_id = edge[1] - self.num_user
-
-            if item_id in high_items:
-                high_edges.append(edge)
-            else:
-                low_edges.append(edge)
-
-        low_edges = np.array(low_edges, dtype=np.int64)
-        high_edges = np.array(high_edges, dtype=np.int64)
-
-        self.edge_index_low = torch.tensor(low_edges, dtype=torch.long).t().contiguous().to(self.device)
-        self.edge_index_high = torch.tensor(high_edges, dtype=torch.long).t().contiguous().to(self.device)
-
-        self.edge_index_low = torch.cat(
-            (self.edge_index_low, self.edge_index_low[[1, 0]]),
-            dim=1
+        self.register_buffer(
+            'edge_index',
+            torch.cat([forward_edges, reverse_edges], dim=1)
         )
 
-        self.edge_index_high = torch.cat(
-            (self.edge_index_high, self.edge_index_high[[1, 0]]),
-            dim=1
-        )
-        # self.edge = concat 2 edge_index to make the graph undirected
-        self.edge_index = torch.cat((self.edge_index_low, self.edge_index_high), dim=1)
+        # item_ids = edge_index[:, 1] - self.num_user
+        # item_degree = np.bincount(item_ids, minlength=self.num_item)
 
-        self.idl_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+        # high_ratio = 0.10
+        # num_high = int(self.num_item * high_ratio)
+
+        # high_items = np.argsort(item_degree)[-num_high:]
+        # high_items = set(high_items.tolist())
+
+        # low_edges = []
+        # high_edges = []
+
+        # for edge in edge_index:
+        #     item_id = edge[1] - self.num_user
+
+        #     if item_id in high_items:
+        #         high_edges.append(edge)
+        #     else:
+        #         low_edges.append(edge)
+
+        # low_edges = np.array(low_edges, dtype=np.int64)
+        # high_edges = np.array(high_edges, dtype=np.int64)
+
+        # self.edge_index_low = torch.tensor(low_edges, dtype=torch.long).t().contiguous().to(self.device)
+        # self.edge_index_high = torch.tensor(high_edges, dtype=torch.long).t().contiguous().to(self.device)
+
+        # self.edge_index_low = torch.cat(
+        #     (self.edge_index_low, self.edge_index_low[[1, 0]]),
+        #     dim=1
+        # )
+
+        # self.edge_index_high = torch.cat(
+        #     (self.edge_index_high, self.edge_index_high[[1, 0]]),
+        #     dim=1
+        # )
+        # # self.edge = concat 2 edge_index to make the graph undirected
+        # self.edge_index = torch.cat((self.edge_index_low, self.edge_index_high), dim=1)
+
+        self.gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
                         num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
-                        device=self.device, features=self.id_embedding_low.weight)
-        self.idh_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
-                        num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
-                        device=self.device, features=self.id_embedding_high.weight)
+                        device=self.device, features=self.id_embedding.weight)
+        # self.idh_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+        #                 num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
+        #                 device=self.device, features=self.id_embedding_high.weight)
         if config['fusion'] in ['add', 'pool']:
             pass
         elif config['fusion'] == 'Multi-Head Attention':
@@ -161,22 +174,20 @@ class GLORIA(GeneralRecommender):
         # item_feat = self.mlp_item(self.t_feat)
         # user_feat = F.normalize(self.mlp_user(self.user_feat))
         
-        self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index, self.id_embedding_low.weight)
-        self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
+        self.item_id, self.t_preference = self.gcn(self.edge_index, self.id_embedding.weight)
 
-        # self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index_low, self.id_embedding_low.weight)
-        # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index_high, self.id_embedding_high.weight)
+        # item_repl = self.idl_rep[self.num_user:]
+        # item_reph = self.idh_rep[self.num_user:]
 
-        item_repl = self.idl_rep[self.num_user:]
-        item_reph = self.idh_rep[self.num_user:]
-
-        item_rep = torch.cat((item_repl, item_reph), dim=1)
+        # item_rep = torch.cat((item_repl, item_reph), dim=1)
+        
+        item_rep = self.item_id[self.num_user:]
         item_rep = self.item_item(item_rep)
 
-        user_repl = self.idl_rep[:self.num_user]
-        user_reph = self.idh_rep[:self.num_user]
+        user_rep = self.item_id[:self.num_user]
+        # user_reph = self.idh_rep[:self.num_user]
 
-        user_rep = torch.cat((user_repl, user_reph), dim=1)
+        # user_rep = torch.cat((user_repl, user_reph), dim=1)
 
         self.result_embed = torch.cat((user_rep, item_rep), dim=0)
         user_tensor = self.result_embed[user_nodes]

@@ -10,6 +10,7 @@ recommend_topk: 'recommend_topk/'
 
 embedding_size: 64
 
+
 # training settings
 epochs: 1000
 stopping_step: 30

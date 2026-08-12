@@ -19,9 +19,9 @@ from common.init import xavier_uniform_initialization
 from torch.nn import MultiheadAttention
 # from .transformer import TransformerEncoder
 
-class GLORIA(GeneralRecommender):
+class MASKED_GLORIA(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(GLORIA, self).__init__(config, dataset)
+        super(MASKED_GLORIA, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
@@ -52,8 +52,10 @@ class GLORIA(GeneralRecommender):
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
-        self.id_embedding_low = nn.Embedding(num_item, self.feat_embed_dim)
-        self.id_embedding_high = nn.Embedding(num_item, self.feat_embed_dim)
+        # self.id_embedding_low = nn.Embedding(num_item, self.feat_embed_dim)
+        # self.id_embedding_high = nn.Embedding(num_item, self.feat_embed_dim)
+        self.id_embedding_full = nn.Embedding(num_item, self.feat_embed_dim)
+        self.id_embedding_masked = nn.Embedding(num_item, self.feat_embed_dim)
 
         self.mlp_item = nn.Linear(self.t_feat.shape[-1], self.dim_latent, bias=False)
         self.mlp_user = nn.Linear(self.user_feat.shape[-1], self.dim_latent, bias=False)
@@ -62,6 +64,27 @@ class GLORIA(GeneralRecommender):
         self.mm_adj = text_adj
 
         train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
+
+        edge_index = self.pack_edge_index(train_interactions)
+
+        self.num_interactions = edge_index.shape[0]
+
+        edge_index = torch.tensor(edge_index, 
+                                  dtype=torch.long,
+                                  device = self.device).t().contiguous()
+
+        self.edge_index = torch.cat(
+                            [edge_index, edge_index[[1, 0]]],
+                            dim=1
+                        )
+
+        self.mask_logits = nn.Parameter(
+                            torch.zeros(
+                                self.num_interactions,
+                                device=self.device
+                            )
+                        )
+
         edge_index = self.pack_edge_index(train_interactions)
 
         item_ids = edge_index[:, 1] - self.num_user
@@ -100,14 +123,44 @@ class GLORIA(GeneralRecommender):
             dim=1
         )
         # self.edge = concat 2 edge_index to make the graph undirected
-        self.edge_index = torch.cat((self.edge_index_low, self.edge_index_high), dim=1)
+        # self.edge_index = torch.cat((self.edge_index_low, self.edge_index_high), dim=1)
 
-        self.idl_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
-                        num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
-                        device=self.device, features=self.id_embedding_low.weight)
-        self.idh_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
-                        num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
-                        device=self.device, features=self.id_embedding_high.weight)
+        # self.idl_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+        #                 num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
+        #                 device=self.device, features=self.id_embedding.weight)
+        # self.idh_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+        #                 num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
+        #                 device=self.device, features=self.id_embedding.weight)
+
+        self.full_gcn = GCN(
+                        self.dataset,
+                        batch_size,
+                        num_user,
+                        num_item,
+                        dim_x,
+                        self.aggr_mode,
+                        num_layer=self.num_layer,
+                        has_feature=False,
+                        dropout=self.drop_rate,
+                        dim_latent=64,
+                        device=self.device,
+                        features=self.id_embedding_full.weight
+                    )
+
+        self.mask_gcn = GCN(
+            self.dataset,
+            batch_size,
+            num_user,
+            num_item,
+            dim_x,
+            self.aggr_mode,
+            num_layer=self.num_layer,
+            has_feature=False,
+            dropout=self.drop_rate,
+            dim_latent=64,
+            device=self.device,
+            features=self.id_embedding_masked.weight
+        )
         if config['fusion'] in ['add', 'pool']:
             pass
         elif config['fusion'] == 'Multi-Head Attention':
@@ -161,20 +214,35 @@ class GLORIA(GeneralRecommender):
         # item_feat = self.mlp_item(self.t_feat)
         # user_feat = F.normalize(self.mlp_user(self.user_feat))
         
-        self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index, self.id_embedding_low.weight)
-        self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
+        # self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index, self.id_embedding_low.weight)
+        # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
 
-        # self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index_low, self.id_embedding_low.weight)
-        # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index_high, self.id_embedding_high.weight)
+        self.full_rep, self.full_preference = self.full_gcn(
+                                                self.edge_index_low,
+                                                self.id_embedding_full.weight
+                                            )
 
-        item_repl = self.idl_rep[self.num_user:]
-        item_reph = self.idh_rep[self.num_user:]
+        mask = torch.sigmoid(self.mask_logits)
+
+        edge_mask = torch.cat(
+                        [mask, mask],
+                        dim=0
+                    )
+
+        self.mask_rep, self.mask_preference = self.mask_gcn(
+                                                self.edge_index,
+                                                self.id_embedding_masked.weight,
+                                                edge_mask=edge_mask
+                                            )
+
+        item_repl = self.full_rep[self.num_user:]
+        item_reph = self.mask_rep[self.num_user:]
 
         item_rep = torch.cat((item_repl, item_reph), dim=1)
         item_rep = self.item_item(item_rep)
 
-        user_repl = self.idl_rep[:self.num_user]
-        user_reph = self.idh_rep[:self.num_user]
+        user_repl = self.full_rep[:self.num_user]
+        user_reph = self.mask_rep[:self.num_user]
 
         user_rep = torch.cat((user_repl, user_reph), dim=1)
 
@@ -227,14 +295,14 @@ class GCN(torch.nn.Module):
                 gain=1))
             self.conv_embed_1 = Base_gcn(self.dim_latent, self.dim_latent, aggr=self.aggr_mode)
 
-    def forward(self,edge_index,features):
+    def forward(self,edge_index,features, edge_mask = None):
         temp_features = features
         temp_profile = self.preference
         x = torch.cat((temp_profile, temp_features), dim=0)
         x = F.normalize(x)
-        h = self.conv_embed_1(x, edge_index)  # equation 1
-        h_1 = self.conv_embed_1(h, edge_index)
-        h_2 = self.conv_embed_1(h_1, edge_index)
+        h = self.conv_embed_1(x, edge_index,edge_mask)  # equation 1
+        h_1 = self.conv_embed_1(h, edge_index,edge_mask)  # equation 1
+        h_2 = self.conv_embed_1(h_1, edge_index,edge_mask)
 
         x_hat =h + x + h_1 + h_2
         return x_hat, self.preference
@@ -247,23 +315,40 @@ class Base_gcn(MessagePassing):
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-    def forward(self, x, edge_index, size=None):
+    def forward(self, x, edge_index,edge_mask=None, size=None):
         # pdb.set_trace()
+
+        if edge_mask is None:
+            edge_mask = torch.ones(
+                edge_index.size(1),
+                device=x.device,
+                dtype=x.dtype
+            )
+
         if size is None:
             edge_index, _ = remove_self_loops(edge_index)
             # edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
         x = x.unsqueeze(-1) if x.dim() == 1 else x
         # pdb.set_trace()
-        return self.propagate(edge_index, size=(x.size(0), x.size(0)), x=x)
+        return self.propagate(edge_index, size=(x.size(0), x.size(0)), x=x, edge_mask = edge_mask)
 
-    def message(self, x_j, edge_index, size):
+    def message(self, x_j, edge_index, size,edge_mask):
         if self.aggr == 'add':
             # pdb.set_trace()
             row, col = edge_index
             deg = degree(row, size[0], dtype=x_j.dtype)
             deg_inv_sqrt = deg.pow(-0.5)
+            deg_inv_sqrt[
+            torch.isinf(deg_inv_sqrt)
+            ] = 0
+
             norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-            return norm.view(-1, 1) * x_j
+            # return norm.view(-1, 1) * x_j
+            return (
+                norm.view(-1, 1)
+                * edge_mask.view(-1, 1)
+                * x_j
+            )
         return x_j
 
     def update(self, aggr_out):
