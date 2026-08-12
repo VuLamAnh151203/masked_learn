@@ -114,16 +114,6 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
         # Error-aware specialist settings.
         # -------------------------------------------------------------
 
-        # Initial probability of every specialist edge mask.
-        self.specialist_mask_init = float(
-            _cfg(config, 'specialist_mask_init', 0.50)
-        )
-
-        # Tiny symmetry-breaking noise added in logit space.
-        self.specialist_mask_init_noise = float(
-            _cfg(config, 'specialist_mask_init_noise', 1e-2)
-        )
-
         # Strength of the error-aware specialist objective.
         self.specialist_weight = float(
             _cfg(config, 'specialist_weight', 0.10)
@@ -139,11 +129,6 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
         self.hardness_temperature = float(
             _cfg(config, 'hardness_temperature', 1.0)
         )
-
-        if not (0.0 < self.specialist_mask_init < 1.0):
-            raise ValueError(
-                "Require 0 < specialist_mask_init < 1."
-            )
 
         if self.specialist_weight < 0.0:
             raise ValueError(
@@ -168,14 +153,9 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
             self.feat_embed_dim
         )
 
-        nn.init.xavier_uniform_(
-            self.id_embedding_full.weight
-        )
-
-        with torch.no_grad():
-            self.id_embedding_specialist.weight.copy_(
-                self.id_embedding_full.weight
-            )
+        # Match the strong Full + Mask baseline:
+        # keep the two embedding tables independently initialized.
+        # nn.Embedding initializes them independently by default.
 
         # These were present in your original model. Keep them if the rest of
         # your project uses them, even though the causal/non-causal UI branch
@@ -217,44 +197,24 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
         # -------------------------------------------------------------
         # One learnable soft mask for the specialist branch.
         #
-        # The full branch uses edge_mask=None and therefore always keeps
-        # the complete user-item graph.
+        # Match the strong Full + Mask baseline exactly:
+        #     mask_logits = 0  ->  sigmoid(mask_logits) = 0.5
         # -------------------------------------------------------------
-        specialist_init_mask = torch.full(
-            (self.num_interactions,),
-            self.specialist_mask_init,
-            dtype=torch.float32,
-            device=self.device
-        )
-
-        def probability_to_logit(prob):
-            prob = prob.clamp(
-                min=1e-4,
-                max=1.0 - 1e-4
-            )
-
-            return torch.log(
-                prob / (1.0 - prob)
-            )
-
-        specialist_init_logits = probability_to_logit(
-            specialist_init_mask
-        )
-
-        if self.specialist_mask_init_noise > 0.0:
-            specialist_init_logits = (
-                specialist_init_logits
-                + self.specialist_mask_init_noise
-                * torch.randn_like(specialist_init_logits)
-            )
-
         self.specialist_mask_logits = nn.Parameter(
-            specialist_init_logits
+            torch.zeros(
+                self.num_interactions,
+                device=self.device
+            )
         )
 
         self.register_buffer(
             'initial_specialist_mask',
-            specialist_init_mask
+            torch.full(
+                (self.num_interactions,),
+                0.5,
+                dtype=torch.float32,
+                device=self.device
+            )
         )
 
         # -------------------------------------------------------------
@@ -504,8 +464,14 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
 
     @staticmethod
     def bpr_loss(pos_scores, neg_scores):
-        # Numerically stable equivalent of -log(sigmoid(pos-neg)).
-        return -F.logsigmoid(pos_scores - neg_scores).mean()
+        # Match the original strong Full + Mask objective exactly.
+        return -torch.mean(
+            torch.log2(
+                torch.sigmoid(
+                    pos_scores - neg_scores
+                )
+            )
+        )
 
     # -----------------------------------------------------------------
     # Main forward
@@ -577,39 +543,44 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
     # -----------------------------------------------------------------
     def calculate_loss(self, interaction):
         """
-        Error-aware specialist objective.
+        Clean error-aware specialist experiment.
 
-        1) Fused BPR trains the final [full || specialist] recommender.
+        specialist_weight == 0:
+            exactly the original Full + Mask BPR objective.
 
-        2) The full branch identifies hard samples.
-
-        3) The specialist branch gets extra BPR pressure only on samples
-           that the full branch currently finds difficult.
+        specialist_weight > 0:
+            fused BPR + error-aware weighted specialist BPR.
         """
+
+        # Exact Full + Mask baseline path.
+        if self.specialist_weight == 0.0:
+            pos_scores, neg_scores = self.forward(
+                interaction,
+                return_aux=False
+            )
+
+            return self.bpr_loss(
+                pos_scores,
+                neg_scores
+            )
+
+        # Error-aware specialist path.
         pos_scores, neg_scores, aux = self.forward(
             interaction,
             return_aux=True
         )
 
-        # -------------------------------------------------------------
-        # Main fused recommendation loss.
-        # -------------------------------------------------------------
         main_bpr = self.bpr_loss(
             pos_scores,
             neg_scores
         )
 
-        # -------------------------------------------------------------
-        # Full/generalist margin.
-        #
-        # Detach it before constructing hardness so the full branch cannot
-        # manipulate the sample weights.
-        # -------------------------------------------------------------
         full_margin = (
             aux['full_pos_scores']
             - aux['full_neg_scores']
         )
 
+        # Stop gradients through hardness.
         with torch.no_grad():
             hardness = torch.sigmoid(
                 (
@@ -619,16 +590,16 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
                 / self.hardness_temperature
             )
 
-        # -------------------------------------------------------------
-        # Specialist branch pairwise margin.
-        # -------------------------------------------------------------
         specialist_margin = (
             aux['specialist_pos_scores']
             - aux['specialist_neg_scores']
         )
 
-        specialist_per_sample_loss = -F.logsigmoid(
-            specialist_margin
+        # Same log2 BPR scale as the baseline.
+        specialist_per_sample_loss = -torch.log2(
+            torch.sigmoid(
+                specialist_margin
+            )
         )
 
         specialist_loss = (
@@ -644,59 +615,30 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
             * specialist_loss
         )
 
-        # -------------------------------------------------------------
-        # Diagnostics only.
-        # -------------------------------------------------------------
         with torch.no_grad():
             specialist_mask = aux['specialist_mask']
+            fused_margin = pos_scores - neg_scores
 
-            fused_margin = (
-                pos_scores - neg_scores
-            )
-
-            # w > 0.5 means:
-            # full_margin < hardness_margin
             hard_fraction = (
                 hardness > 0.5
             ).float().mean()
 
             self.loss_components = {
-                'total': float(
-                    total_loss.detach().cpu()
-                ),
-
-                'main_bpr': float(
-                    main_bpr.detach().cpu()
-                ),
-
-                'specialist_loss': float(
-                    specialist_loss.detach().cpu()
-                ),
-
-                'hardness_mean': float(
-                    hardness.mean().cpu()
-                ),
-
-                'hard_fraction': float(
-                    hard_fraction.cpu()
-                ),
-
-                'full_margin_mean': float(
-                    full_margin.mean().detach().cpu()
-                ),
-
+                'total': float(total_loss.detach().cpu()),
+                'main_bpr': float(main_bpr.detach().cpu()),
+                'specialist_loss': float(specialist_loss.detach().cpu()),
+                'hardness_mean': float(hardness.mean().cpu()),
+                'hard_fraction': float(hard_fraction.cpu()),
+                'full_margin_mean': float(full_margin.mean().detach().cpu()),
                 'specialist_margin_mean': float(
                     specialist_margin.mean().detach().cpu()
                 ),
-
                 'fused_margin_mean': float(
                     fused_margin.mean().detach().cpu()
                 ),
-
                 'specialist_mask_mean': float(
                     specialist_mask.mean().detach().cpu()
                 ),
-
                 'specialist_mask_change_from_init': float(
                     (
                         specialist_mask
@@ -715,17 +657,6 @@ class FULL_ERROR_AWARE_SPECIALIST(GeneralRecommender):
     # Evaluation
     # -----------------------------------------------------------------
     def full_sort_predict(self, interaction):
-        (
-            full_rep,
-            specialist_rep,
-            _
-        ) = self.compute_branch_representations()
-
-        self.result_embed = self.fuse_representations(
-            full_rep,
-            specialist_rep
-        )
-
         user_tensor = self.result_embed[:self.n_users]
         item_tensor = self.result_embed[self.n_users:]
 
@@ -859,62 +790,52 @@ class Base_gcn(MessagePassing):
         self.out_channels = out_channels
 
     def forward(self, x, edge_index, edge_mask=None, size=None):
-        x = x.unsqueeze(-1) if x.dim() == 1 else x
-
-        if size is None:
-            size = (x.size(0), x.size(0))
-
-        # Keep edge attributes aligned if self-loops ever appear.
-        edge_index, edge_mask = remove_self_loops(
-            edge_index,
-            edge_mask
-        )
-
         if edge_mask is None:
             edge_mask = torch.ones(
                 edge_index.size(1),
                 device=x.device,
                 dtype=x.dtype
             )
-        else:
-            edge_mask = edge_mask.to(
-                device=x.device,
-                dtype=x.dtype
-            )
 
+        if size is None:
+            edge_index, _ = remove_self_loops(edge_index)
+
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+
+        return self.propagate(
+            edge_index,
+            size=(x.size(0), x.size(0)),
+            x=x,
+            edge_mask=edge_mask
+        )
+
+    def message(self, x_j, edge_index, size, edge_mask):
         if self.aggr == 'add':
             row, col = edge_index
 
             deg = degree(
                 row,
                 size[0],
-                dtype=x.dtype
+                dtype=x_j.dtype
             )
 
             deg_inv_sqrt = deg.pow(-0.5)
-            deg_inv_sqrt.masked_fill_(
-                torch.isinf(deg_inv_sqrt),
-                0.0
-            )
+            deg_inv_sqrt[
+                torch.isinf(deg_inv_sqrt)
+            ] = 0
 
             norm = (
                 deg_inv_sqrt[row]
                 * deg_inv_sqrt[col]
             )
 
-            edge_weight = norm * edge_mask
-        else:
-            edge_weight = edge_mask
+            return (
+                norm.view(-1, 1)
+                * edge_mask.view(-1, 1)
+                * x_j
+            )
 
-        return self.propagate(
-            edge_index,
-            size=size,
-            x=x,
-            edge_weight=edge_weight
-        )
-
-    def message(self, x_j, edge_weight):
-        return edge_weight.view(-1, 1) * x_j
+        return x_j
 
     def update(self, aggr_out):
         return aggr_out
