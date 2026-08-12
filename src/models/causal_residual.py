@@ -80,6 +80,24 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
         self.mask_balance_weight = float(_cfg(config, 'mask_balance_weight', 0.1))
         self.causal_ratio = float(_cfg(config, 'causal_ratio', 0.5))
         self.mask_random_eps = float(_cfg(config, 'mask_random_eps', 1e-4))
+        # self.alpha = 0.5
+        # self.beta = 0.5
+
+        self.residual_alpha_logit = nn.Parameter(
+                        torch.tensor(
+                            0.0,
+                            dtype=torch.float32,
+                            device=self.device
+                        )
+                    )
+
+        self.residual_beta_logit = nn.Parameter(
+                                torch.tensor(
+                                    0.0,
+                                    dtype=torch.float32,
+                                    device=self.device
+                                )
+                            )
 
         # -------------------------------------------------------------
         # Separate item embeddings for causal and non-causal branches.
@@ -364,8 +382,14 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
             / causal_rep.pow(2).sum(dim=1, keepdim=True).clamp_min(eps)
         )
 
-        projection = projection_scale * causal_rep
-        residual_rep = complementary_rep - projection
+        alpha = torch.sigmoid(
+                        self.residual_alpha_logit
+                    )
+        causal_direction = causal_rep.detach()
+        projection = projection_scale * causal_direction
+        # residual_rep = complementary_rep - projection
+        residual_rep = complementary_rep - alpha * projection
+
 
         return residual_rep
 
@@ -402,22 +426,35 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
         item_causal = causal_rep[self.num_user:]
         item_residual = residual_rep[self.num_user:]
 
-        user_rep = torch.cat(
-            [user_causal, user_residual],
-            dim=1
-        )
+        # user_rep = torch.cat(
+        #     [user_causal, user_residual],
+        #     dim=1
+        # )
 
+        # item_rep = torch.cat(
+        #     [item_causal, item_residual],
+        #     dim=1
+        # )
+
+        beta = torch.sigmoid(
+                        self.residual_beta_logit)
+        
+        user_rep = torch.cat(
+                [user_causal, beta * user_residual],
+                dim=1
+            )
+    
         item_rep = torch.cat(
-            [item_causal, item_residual],
-            dim=1
-        )
+                [item_causal, beta * item_residual],
+                dim=1
+            )
 
         item_rep = self.item_item(item_rep)
-
+        
         return torch.cat(
-            [user_rep, item_rep],
-            dim=0
-        )
+                    [user_rep, item_rep],
+                    dim=0
+                )
 
     # -----------------------------------------------------------------
     # Scoring helpers
