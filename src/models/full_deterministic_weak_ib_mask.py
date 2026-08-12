@@ -60,7 +60,7 @@ class FULL_DETERMINISTIC_WEAK_IB_MASK(GeneralRecommender):
         self.ib_beta = float(
             config['ib_beta']
             if config['ib_beta'] is not None
-            else 0.0
+            else 1e-4
         )
 
         self.ib_prior_retention = float(
