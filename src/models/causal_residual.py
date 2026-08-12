@@ -363,7 +363,7 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
         return random_noncausal_rep
 
     @staticmethod
-    def remove_causal_projection(causal_rep, complementary_rep, eps=1e-8):
+    def remove_causal_projection(self,causal_rep, complementary_rep, eps=1e-8):
         """
         Remove from the complementary representation the component that is
         parallel to the causal representation, independently for every node.
