@@ -129,7 +129,7 @@ class FULL_DETERMINISTIC_WEAK_IB_MASK(GeneralRecommender):
 
         # Weak IB regularization strength.
         self.ib_beta = float(
-            _cfg(config, 'ib_beta', 1e-4)
+            _cfg(config, 'ib_beta', 0.0)
         )
 
         # Small logit-space initialization noise.
