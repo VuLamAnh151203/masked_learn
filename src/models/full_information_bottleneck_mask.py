@@ -56,8 +56,9 @@ Interpretation:
 Important implementation choices
 --------------------------------
 1) The full graph branch is NEVER masked.
-2) The IB mask is stochastic only during training.
-3) Evaluation uses the deterministic expected mask pi_e by default.
+2) If ib_beta == 0, the model exactly uses the deterministic Full + Mask path.
+3) If ib_beta > 0, the IB mask is stochastic only during training.
+4) IB evaluation uses the deterministic expected mask pi_e.
 4) A straight-through hard mask can optionally be enabled.
 5) The KL bottleneck is computed from pi_e, not from the random sample.
 
@@ -121,7 +122,7 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
         # Start relatively dense so training does not immediately destroy
         # useful collaborative structure.
         self.ib_mask_init_prob = float(
-            _cfg(config, 'ib_mask_init_prob', 0.80)
+            _cfg(config, 'ib_mask_init_prob', 0.50)
         )
 
         # Bernoulli prior retention probability rho.
@@ -132,7 +133,7 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
 
         # Weight of the information-bottleneck KL term.
         self.ib_beta = float(
-            _cfg(config, 'ib_beta', 1e-3)
+            _cfg(config, 'ib_beta', 0.0)
         )
 
         # Concrete / Gumbel-Sigmoid temperature.
@@ -168,7 +169,7 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
 
         # Small logit-space initialization noise.
         self.ib_init_noise = float(
-            _cfg(config, 'ib_init_noise', 1e-2)
+            _cfg(config, 'ib_init_noise', 0.0)
         )
 
         if not (0.0 < self.ib_mask_init_prob < 1.0):
@@ -213,14 +214,9 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
             self.feat_embed_dim
         )
 
-        nn.init.xavier_uniform_(
-            self.id_embedding_full.weight
-        )
-
-        with torch.no_grad():
-            self.id_embedding_ib.weight.copy_(
-                self.id_embedding_full.weight
-            )
+        # Match the strong Full + Mask baseline:
+        # keep the two embedding tables independently initialized.
+        # nn.Embedding initializes both independently by default.
 
         # These were present in your original model. Keep them if the rest of
         # your project uses them, even though the causal/non-causal UI branch
@@ -260,51 +256,36 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
         )  # [2, 2E]
 
         # -------------------------------------------------------------
-        # ONE stochastic information-bottleneck mask.
+        # ONE learnable information-bottleneck mask.
         #
-        # Full branch:
-        #   edge_mask = None
+        # CLEAN BASELINE INITIALIZATION:
         #
-        # IB branch:
-        #   pi = sigmoid(ib_mask_logits)
-        #   sampled Concrete mask during training
+        #     ib_mask_logits = 0
+        #     sigmoid(ib_mask_logits) = 0.5
+        #
+        # This matches the strong Full + Mask baseline exactly.
+        #
+        # When ib_beta == 0:
+        #     use the deterministic soft mask directly.
+        #
+        # When ib_beta > 0:
+        #     use stochastic Concrete/Gumbel-Sigmoid sampling during training.
         # -------------------------------------------------------------
-
-        def probability_to_logit(prob):
-            prob = prob.clamp(
-                min=1e-4,
-                max=1.0 - 1e-4
-            )
-
-            return torch.log(
-                prob / (1.0 - prob)
-            )
-
-        initial_ib_prob = torch.full(
-            (self.num_interactions,),
-            self.ib_mask_init_prob,
-            dtype=torch.float32,
-            device=self.device
-        )
-
-        initial_ib_logits = probability_to_logit(
-            initial_ib_prob
-        )
-
-        if self.ib_init_noise > 0.0:
-            initial_ib_logits = (
-                initial_ib_logits
-                + self.ib_init_noise
-                * torch.randn_like(initial_ib_logits)
-            )
-
         self.ib_mask_logits = nn.Parameter(
-            initial_ib_logits
+            torch.zeros(
+                self.num_interactions,
+                device=self.device
+            )
         )
 
         self.register_buffer(
             'initial_ib_mask_prob',
-            initial_ib_prob
+            torch.full(
+                (self.num_interactions,),
+                0.5,
+                dtype=torch.float32,
+                device=self.device
+            )
         )
 
         # -------------------------------------------------------------
@@ -566,33 +547,42 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
             ib_mask:  [E]
             ib_prob:  [E]
 
-        sample_ib:
-            None -> self.training
-            True -> stochastic Concrete sample
-            False -> deterministic evaluation mask
-        """
-        if sample_ib is None:
-            sample_ib = self.training
+        Clean ablation behavior
+        -----------------------
+        ib_beta == 0:
+            deterministic soft mask pi = sigmoid(logits), matching Full + Mask.
 
+        ib_beta > 0:
+            training -> stochastic Concrete/Gumbel-Sigmoid mask
+            eval     -> deterministic expected mask pi
+        """
         ib_prob = self.get_ib_probabilities()
 
-        if sample_ib:
-            ib_mask = self.sample_ib_mask()
+        # -------------------------------------------------------------
+        # EXACT Full + Mask baseline path.
+        # -------------------------------------------------------------
+        if self.ib_beta == 0.0:
+            ib_mask = ib_prob
+
         else:
-            ib_mask = self.get_eval_ib_mask()
+            if sample_ib is None:
+                sample_ib = self.training
+
+            if sample_ib:
+                ib_mask = self.sample_ib_mask()
+            else:
+                ib_mask = self.get_eval_ib_mask()
 
         ib_edge_mask = self.to_bidirectional_mask(
             ib_mask
         )
 
-        # Stable full-graph anchor.
         full_rep, full_preference = self.full_gcn(
             self.edge_index,
             self.id_embedding_full.weight,
             edge_mask=None
         )
 
-        # Compressed stochastic graph view.
         ib_rep, ib_preference = self.ib_gcn(
             self.edge_index,
             self.id_embedding_ib.weight,
@@ -662,8 +652,14 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
 
     @staticmethod
     def bpr_loss(pos_scores, neg_scores):
-        # Numerically stable equivalent of -log(sigmoid(pos-neg)).
-        return -F.logsigmoid(pos_scores - neg_scores).mean()
+        # Match the strong Full + Mask baseline exactly.
+        return -torch.mean(
+            torch.log2(
+                torch.sigmoid(
+                    pos_scores - neg_scores
+                )
+            )
+        )
 
     # -----------------------------------------------------------------
     # Main forward
@@ -717,18 +713,35 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
     # -----------------------------------------------------------------
     def calculate_loss(self, interaction):
         """
-        Full + information-bottleneck masked graph.
+        Clean Full + Mask vs Information-Bottleneck ablation.
 
-        Objective:
+        ib_beta == 0:
+            deterministic Full + Mask + original log2 BPR only.
 
-            L =
-                fused_BPR
-                + ib_beta * KL(
-                    Bern(pi)
-                    ||
-                    Bern(rho)
-                )
+        ib_beta > 0:
+            stochastic IB mask during training
+            + original log2 fused BPR
+            + ib_beta * Bernoulli KL.
         """
+
+        # -------------------------------------------------------------
+        # EXACT Full + Mask baseline path.
+        # -------------------------------------------------------------
+        if self.ib_beta == 0.0:
+            pos_scores, neg_scores = self.forward(
+                interaction,
+                return_aux=False,
+                sample_ib=False
+            )
+
+            return self.bpr_loss(
+                pos_scores,
+                neg_scores
+            )
+
+        # -------------------------------------------------------------
+        # Information-bottleneck training path.
+        # -------------------------------------------------------------
         (
             pos_scores,
             neg_scores,
@@ -751,20 +764,12 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
             + self.ib_beta * ib_kl
         )
 
-        # -------------------------------------------------------------
-        # Diagnostics only.
-        # -------------------------------------------------------------
         with torch.no_grad():
             ib_prob = aux['ib_prob']
             ib_mask = aux['ib_mask']
 
-            expected_retention = (
-                ib_prob.mean()
-            )
-
-            expected_drop = (
-                1.0 - expected_retention
-            )
+            expected_retention = ib_prob.mean()
+            expected_drop = 1.0 - expected_retention
 
             mask_entropy = -(
                 ib_prob
@@ -785,15 +790,12 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
                 'total': float(
                     total_loss.detach().cpu()
                 ),
-
                 'bpr': float(
                     bpr_loss.detach().cpu()
                 ),
-
                 'ib_kl': float(
                     ib_kl.detach().cpu()
                 ),
-
                 'weighted_ib_kl': float(
                     (
                         self.ib_beta
@@ -802,31 +804,18 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
                     .detach()
                     .cpu()
                 ),
-
                 'expected_retention': float(
-                    expected_retention
-                    .detach()
-                    .cpu()
+                    expected_retention.detach().cpu()
                 ),
-
                 'expected_drop_ratio': float(
-                    expected_drop
-                    .detach()
-                    .cpu()
+                    expected_drop.detach().cpu()
                 ),
-
                 'sampled_mask_mean': float(
-                    ib_mask.mean()
-                    .detach()
-                    .cpu()
+                    ib_mask.mean().detach().cpu()
                 ),
-
                 'mask_entropy': float(
-                    mask_entropy
-                    .detach()
-                    .cpu()
+                    mask_entropy.detach().cpu()
                 ),
-
                 'mask_change_from_init': float(
                     (
                         ib_prob
@@ -845,8 +834,27 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
     # Evaluation
     # -----------------------------------------------------------------
     def full_sort_predict(self, interaction):
-        # Deterministic evaluation:
-        # use expected mask pi_e unless ib_eval_hard_mask=True.
+        # -------------------------------------------------------------
+        # Exact Full + Mask baseline evaluation path.
+        # -------------------------------------------------------------
+        if self.ib_beta == 0.0:
+            user_tensor = self.result_embed[:self.n_users]
+            item_tensor = self.result_embed[self.n_users:]
+
+            temp_user_tensor = user_tensor[
+                interaction[0],
+                :
+            ]
+
+            return torch.matmul(
+                temp_user_tensor,
+                item_tensor.t()
+            )
+
+        # -------------------------------------------------------------
+        # IB evaluation:
+        # deterministic expected mask, no random sampling.
+        # -------------------------------------------------------------
         (
             full_rep,
             ib_rep,
@@ -869,12 +877,11 @@ class FULL_INFORMATION_BOTTLENECK_MASK(GeneralRecommender):
             :
         ]
 
-        score_matrix = torch.matmul(
+        return torch.matmul(
             temp_user_tensor,
             item_tensor.t()
         )
 
-        return score_matrix
 
 
 class GCN(torch.nn.Module):
@@ -994,62 +1001,54 @@ class Base_gcn(MessagePassing):
         self.out_channels = out_channels
 
     def forward(self, x, edge_index, edge_mask=None, size=None):
-        x = x.unsqueeze(-1) if x.dim() == 1 else x
-
-        if size is None:
-            size = (x.size(0), x.size(0))
-
-        # Keep edge attributes aligned if self-loops ever appear.
-        edge_index, edge_mask = remove_self_loops(
-            edge_index,
-            edge_mask
-        )
-
         if edge_mask is None:
             edge_mask = torch.ones(
                 edge_index.size(1),
                 device=x.device,
                 dtype=x.dtype
             )
-        else:
-            edge_mask = edge_mask.to(
-                device=x.device,
-                dtype=x.dtype
+
+        if size is None:
+            edge_index, _ = remove_self_loops(
+                edge_index
             )
 
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+
+        return self.propagate(
+            edge_index,
+            size=(x.size(0), x.size(0)),
+            x=x,
+            edge_mask=edge_mask
+        )
+
+    def message(self, x_j, edge_index, size, edge_mask):
         if self.aggr == 'add':
             row, col = edge_index
 
             deg = degree(
                 row,
                 size[0],
-                dtype=x.dtype
+                dtype=x_j.dtype
             )
 
             deg_inv_sqrt = deg.pow(-0.5)
-            deg_inv_sqrt.masked_fill_(
-                torch.isinf(deg_inv_sqrt),
-                0.0
-            )
+            deg_inv_sqrt[
+                torch.isinf(deg_inv_sqrt)
+            ] = 0
 
             norm = (
                 deg_inv_sqrt[row]
                 * deg_inv_sqrt[col]
             )
 
-            edge_weight = norm * edge_mask
-        else:
-            edge_weight = edge_mask
+            return (
+                norm.view(-1, 1)
+                * edge_mask.view(-1, 1)
+                * x_j
+            )
 
-        return self.propagate(
-            edge_index,
-            size=size,
-            x=x,
-            edge_weight=edge_weight
-        )
-
-    def message(self, x_j, edge_weight):
-        return edge_weight.view(-1, 1) * x_j
+        return x_j
 
     def update(self, aggr_out):
         return aggr_out
