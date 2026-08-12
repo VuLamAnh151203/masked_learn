@@ -218,7 +218,7 @@ class MASKED_GLORIA(GeneralRecommender):
         # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
 
         self.full_rep, self.full_preference = self.full_gcn(
-                                                self.edge_index_low,
+                                                self.edge_index,
                                                 self.id_embedding_full.weight
                                             )
 
