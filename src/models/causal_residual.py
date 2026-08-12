@@ -363,7 +363,7 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
         return random_noncausal_rep
 
     @staticmethod
-    def remove_causal_projection(self,causal_rep, complementary_rep, eps=1e-8):
+    def remove_causal_projection(residual_alpha_logit,causal_rep, complementary_rep, eps=1e-8):
         """
         Remove from the complementary representation the component that is
         parallel to the causal representation, independently for every node.
@@ -383,7 +383,7 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
         )
 
         alpha = torch.sigmoid(
-                        self.residual_alpha_logit
+                        residual_alpha_logit
                     )
         causal_direction = causal_rep.detach()
         projection = projection_scale * causal_direction
@@ -414,6 +414,7 @@ class CAUSAL_RESIDUAL(GeneralRecommender):
         contribute information that is different from the causal/core half.
         """
         residual_rep = self.remove_causal_projection(
+            self.residual_alpha_logit,
             causal_rep,
             noncausal_rep
         )
