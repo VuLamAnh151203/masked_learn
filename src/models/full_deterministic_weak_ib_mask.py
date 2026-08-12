@@ -118,7 +118,7 @@ class FULL_DETERMINISTIC_WEAK_IB_MASK(GeneralRecommender):
 
         # Initial soft-mask probability.
         self.mask_init_prob = float(
-            _cfg(config, 'mask_init_prob', 0.80)
+            _cfg(config, 'mask_init_prob', 0.50)
         )
 
         # Bernoulli prior retention probability rho.
