@@ -13,9 +13,9 @@ from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import remove_self_loops, add_self_loops, degree
 import torch_geometric
 
-from Experiment.CaMuRe.src.common.abstract_recommender import GeneralRecommender
-from Experiment.CaMuRe.src.common.loss import BPRLoss, EmbLoss
-from Experiment.CaMuRe.src.common.init import xavier_uniform_initialization
+from common.abstract_recommender import GeneralRecommender
+from common.loss import BPRLoss, EmbLoss
+from common.init import xavier_uniform_initialization
 from torch.nn import MultiheadAttention
 # from .transformer import TransformerEncoder
 
