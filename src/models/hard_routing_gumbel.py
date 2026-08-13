@@ -54,7 +54,7 @@ import torch.nn.functional as F
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import remove_self_loops
 
-from common.abstract_recommender import GeneralRecommender
+from Experiment.CaMuRe.src.common.abstract_recommender import GeneralRecommender
 
 
 def _cfg(config, key, default):
