@@ -49,7 +49,7 @@ class MASKED_GLORIA(GeneralRecommender):
         self.mm_adj = None
         self.config = config
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
-        self.orthogonal_loss = 1e-3
+        self.orthogonal_param = 0.5
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
@@ -282,7 +282,7 @@ class MASKED_GLORIA(GeneralRecommender):
         pos_scores, neg_scores, orthogonal_loss = self.forward(interaction)
         loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
 
-        lambda_orth = self.lambda_orth
+        lambda_orth = self.orthogonal_param
         loss = (loss_value + lambda_orth * orthogonal_loss)
         # return loss_value
         return loss
