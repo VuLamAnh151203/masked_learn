@@ -49,6 +49,8 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         self.mm_adj = None
         self.config = config
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
+
+        self.lambda_cf = 0.01
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
@@ -84,33 +86,6 @@ class MASKED_GLORIA_EX(GeneralRecommender):
                                 device=self.device
                             )
                         )
-
-        # ------------------------------------------------------------
-        # Counterfactual-aware adaptive fusion
-        # ------------------------------------------------------------
-        # The gate learns, for each user, how much to trust the factual
-        # (full-graph) branch versus the counterfactual (masked-graph) branch.
-        #
-        # final score = g_u * score_full + (1 - g_u) * score_mask
-        #
-        # We implement this at representation level by weighting only the
-        # user-side blocks before concatenation, so full_sort_predict can
-        # remain a single matrix multiplication.
-        self.cf_gate = nn.Sequential(
-            nn.Linear(2 * self.feat_embed_dim, self.feat_embed_dim),
-            nn.LeakyReLU(),
-            nn.Linear(self.feat_embed_dim, 1)
-        )
-
-        # Start from g_u = 0.5 for every user. Together with the factor 2
-        # in forward(), this exactly recovers the original score
-        # score_full + score_mask at initialization.
-        nn.init.zeros_(self.cf_gate[-1].weight)
-        nn.init.zeros_(self.cf_gate[-1].bias)
-
-        # Optional auxiliary BPR loss on the masked/counterfactual branch.
-        # Set cf_bpr_weight = 0.0 to test the gate alone.
-        self.cf_bpr_weight = float(0.0)
 
         edge_index = self.pack_edge_index(train_interactions)
 
@@ -234,174 +209,102 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         return rep + h
 
     def forward(self, interaction):
-        user_nodes = interaction[0]
+        user_nodes, pos_item_nodes, neg_item_nodes = interaction[0], interaction[1], interaction[2]
+        pos_item_nodes += self.n_users
+        neg_item_nodes += self.n_users
 
-        # Keep item ids in local item space for branch-specific scores.
-        # Do not modify interaction in-place.
-        pos_item_local = interaction[1]
-        neg_item_local = interaction[2]
+        # item_feat = self.mlp_item(self.t_feat)
+        # user_feat = F.normalize(self.mlp_user(self.user_feat))
+        
+        # self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index, self.id_embedding_low.weight)
+        # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
 
-        pos_item_nodes = pos_item_local + self.n_users
-        neg_item_nodes = neg_item_local + self.n_users
-
-        # ============================================================
-        # 1. Factual branch: full interaction graph
-        # ============================================================
         self.full_rep, self.full_preference = self.full_gcn(
-            self.edge_index,
-            self.id_embedding_full.weight
-        )
+                                                self.edge_index,
+                                                self.id_embedding_full.weight
+                                            )
 
-        # ============================================================
-        # 2. Counterfactual branch: learnable masked graph
-        # ============================================================
         mask = torch.sigmoid(self.mask_logits)
-        self.current_mask = mask
 
-        # edge_index contains original edges followed by reverse edges,
-        # therefore the same learned weight is reused in both directions.
-        edge_mask = torch.cat([mask, mask], dim=0)
+        edge_mask = torch.cat(
+                        [mask, mask],
+                        dim=0
+                    )
 
         self.mask_rep, self.mask_preference = self.mask_gcn(
-            self.edge_index,
-            self.id_embedding_masked.weight,
-            edge_mask=edge_mask
-        )
+                                                self.edge_index,
+                                                self.id_embedding_masked.weight,
+                                                edge_mask=edge_mask
+                                            )
 
-        # ============================================================
-        # 3. Split user/item representations for the two worlds
-        # ============================================================
-        user_full = self.full_rep[:self.num_user]
-        item_full = self.full_rep[self.num_user:]
+        item_repl = self.full_rep[self.num_user:]
+        item_reph = self.mask_rep[self.num_user:]
 
-        user_cf = self.mask_rep[:self.num_user]
-        item_cf = self.mask_rep[self.num_user:]
-
-        self.user_full_rep = user_full
-        self.item_full_rep = item_full
-        self.user_cf_rep = user_cf
-        self.item_cf_rep = item_cf
-
-        # ============================================================
-        # 4. Counterfactual-aware user gate
-        # ============================================================
-        # g_u close to 1 -> trust the full/factual branch more
-        # g_u close to 0 -> trust the masked/counterfactual branch more
-        user_gate = torch.sigmoid(
-            self.cf_gate(
-                torch.cat([user_full, user_cf], dim=1)
-            )
-        )
-
-        self.user_cf_gate = user_gate
-
-        # Important trick:
-        #   [2g*u_full || 2(1-g)*u_cf]^T [i_full || i_cf]
-        # = 2g * <u_full, i_full> + 2(1-g) * <u_cf, i_cf>
-        #
-        # At initialization g = 0.5, therefore this is exactly
-        # <u_full, i_full> + <u_cf, i_cf>, i.e. your original concat score.
-        # The model can then move g away from 0.5 only when useful.
-        user_rep = torch.cat(
-            [
-                2.0 * user_gate * user_full,
-                2.0 * (1.0 - user_gate) * user_cf
-            ],
-            dim=1
-        )
-
-        item_rep = torch.cat(
-            [item_full, item_cf],
-            dim=1
-        )
-
-        # Preserve your original item-item graph propagation. Because this
-        # operation is linear and acts independently on feature dimensions,
-        # the two concatenated branch blocks remain separable.
+        item_rep = torch.cat((item_repl, item_reph), dim=1)
         item_rep = self.item_item(item_rep)
 
-        branch_dim = item_full.size(1)
-        item_full_final = item_rep[:, :branch_dim]
-        item_cf_final = item_rep[:, branch_dim:]
+        user_repl = self.full_rep[:self.num_user]
+        user_reph = self.mask_rep[:self.num_user]
+
+        user_rep = torch.cat((user_repl, user_reph), dim=1)
 
         self.result_embed = torch.cat((user_rep, item_rep), dim=0)
-
         user_tensor = self.result_embed[user_nodes]
         pos_item_tensor = self.result_embed[pos_item_nodes]
         neg_item_tensor = self.result_embed[neg_item_nodes]
-
         pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
         neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
 
-        # ============================================================
-        # 5. Optional counterfactual-only scores for auxiliary CF-BPR
-        # ============================================================
-        cf_user_batch = user_cf[user_nodes]
-        cf_pos_item_batch = item_cf_final[pos_item_local]
-        cf_neg_item_batch = item_cf_final[neg_item_local]
+
+        pos_item_local = pos_item_nodes - self.num_user
+        neg_item_local = neg_item_nodes - self.num_user
+
+        cf_user = user_reph[user_nodes]
+
+        cf_pos_item = item_reph[pos_item_local]
+        cf_neg_item = item_reph[neg_item_local]
 
         cf_pos_scores = torch.sum(
-            cf_user_batch * cf_pos_item_batch,
+            cf_user * cf_pos_item,
             dim=1
         )
+
         cf_neg_scores = torch.sum(
-            cf_user_batch * cf_neg_item_batch,
+            cf_user * cf_neg_item,
             dim=1
         )
 
-        return pos_scores, neg_scores, cf_pos_scores, cf_neg_scores
-
-    def calculate_loss(self, interaction):
-        (
+        return (
             pos_scores,
             neg_scores,
             cf_pos_scores,
             cf_neg_scores
-        ) = self.forward(interaction)
+        )
 
-        # Main BPR loss from adaptively fused factual + counterfactual score.
-        main_loss = -torch.mean(
+    def calculate_loss(self, interaction):
+        (
+        pos_scores,
+        neg_scores,
+        cf_pos_scores,
+        cf_neg_scores
+        ) = self.forward(interaction)
+        main_loss = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores))) + 1e-8
+
+         # Counterfactual / masked branch BPR
+        cf_loss = -torch.mean(
             torch.log2(
-                torch.sigmoid(pos_scores - neg_scores).clamp_min(1e-12)
+                torch.sigmoid(
+                    cf_pos_scores - cf_neg_scores
+                ) + 1e-8
             )
         )
 
-        # Optional auxiliary loss: the masked/counterfactual branch should
-        # remain recommendation-useful on its own.
-        if self.cf_bpr_weight > 0.0:
-            cf_loss = -torch.mean(
-                torch.log2(
-                    torch.sigmoid(
-                        cf_pos_scores - cf_neg_scores
-                    ).clamp_min(1e-12)
-                )
-            )
-            loss_value = main_loss + self.cf_bpr_weight * cf_loss
-        else:
-            cf_loss = main_loss.new_zeros(())
-            loss_value = main_loss
-
-        # Useful for logging/debugging without changing trainer API.
-        self.last_main_loss = main_loss.detach()
-        self.last_cf_loss = cf_loss.detach()
-
-        return loss_value
-
-    @torch.no_grad()
-    def get_cf_gate_statistics(self):
-        """Return simple diagnostics for the learned user gate."""
-        if not hasattr(self, 'user_cf_gate'):
-            return {}
-
-        gate = self.user_cf_gate.squeeze(-1)
-        return {
-            'mean_full_weight': gate.mean().item(),
-            'mean_cf_weight': (1.0 - gate).mean().item(),
-            'min_full_weight': gate.min().item(),
-            'max_full_weight': gate.max().item(),
-            'fraction_full_dominant': (gate > 0.5).float().mean().item(),
-            'fraction_cf_dominant': (gate < 0.5).float().mean().item(),
-        }
+        loss = (
+            main_loss
+            + self.lambda_cf * cf_loss
+        )
+        
+        return loss
 
     def full_sort_predict(self, interaction):
         user_tensor = self.result_embed[:self.n_users]
