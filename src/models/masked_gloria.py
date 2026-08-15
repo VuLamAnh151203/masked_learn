@@ -49,7 +49,7 @@ class MASKED_GLORIA(GeneralRecommender):
         self.mm_adj = None
         self.config = config
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
-        self.orthogonal_param = 0.5
+        self.orthogonal_param = 1e-2
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
