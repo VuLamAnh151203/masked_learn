@@ -921,38 +921,33 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         )
 
         # ============================================================
-        # Counterfactual Neighborhood Response Learning
+        # STOCHASTIC COUNTERFACTUAL NEIGHBORHOOD INTERVENTION
         # ============================================================
-        # For a user with current mask m_u, construct two local
-        # counterfactual interventions:
+        # Deterministic learned user-level neighborhood strength:
+        #     m_u = sigmoid(user_mask_logits[u])
         #
-        #     m_u^- = clip(m_u - delta, 0, 1)  -> MORE compression
-        #     m_u^+ = clip(m_u + delta, 0, 1)  -> LESS compression
+        # During TRAINING only, sample one local counterfactual world:
+        #     m_tilde_u = clip(m_u + eps_u, 0, 1)
+        #     eps_u ~ Uniform(-cf_delta, +cf_delta)
         #
-        # We compare the factual BPR loss with the two counterfactual
-        # losses, then move m_u toward the locally better intervention.
+        # During VALIDATION / TEST:
+        #     m_tilde_u = m_u
         #
-        # IMPORTANT:
-        #   - No adversarial training.
-        #   - Counterfactual GCN passes are used as detached probes.
-        #   - Only the user-mask scalar receives the response loss.
-        #   - The original recommendation BPR still trains the full model.
+        # Setting cf_delta = 0.0 exactly recovers the deterministic
+        # Full + User Scalar Mask baseline.
         self.cf_delta = float(0.10)
-        self.cf_response_weight = float(0.01)
-        self.cf_min_improvement = float(0.0)
-        self.cf_response_interval = int(1)
 
-        # Internal counter used only to optionally reduce training cost.
-        self._cf_train_step = 0
+        # Optional probability of applying the stochastic intervention
+        # on a training forward pass. Keep 1.0 for the main experiment.
+        self.cf_apply_prob = float(1.0)
 
-        # Diagnostics from the most recent response-learning step.
-        self.cf_last_stats = {
-            'response_loss': 0.0,
-            'fraction_more_compression': 0.0,
-            'fraction_less_compression': 0.0,
-            'fraction_stable': 1.0,
-            'mean_counterfactual_improvement': 0.0,
-        }
+        # Store diagnostics from the most recent forward pass.
+        self.last_base_user_mask = None
+        self.last_sampled_user_mask = None
+        self.last_cf_noise = None
+
+        # Deterministic evaluation embedding cache.
+        self._deterministic_eval_cache_valid = False
 
         edge_index = self.pack_edge_index(train_interactions)
 
@@ -1076,114 +1071,98 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         return rep + h
 
     def get_user_mask(self):
-        """Return one learned neighborhood-strength scalar per user."""
+        """
+        Deterministic learned user-level neighborhood strength.
+
+        Returns:
+            Tensor [num_user] with values in (0, 1).
+
+        This is the mask used at validation/test time.
+        """
         return torch.sigmoid(self.user_mask_logits)
+
+    def get_training_user_mask(self):
+        """
+        Sample ONE stochastic counterfactual neighborhood-strength world.
+
+        Base factual/user-specific strength:
+            m_u = sigmoid(theta_u)
+
+        Training counterfactual:
+            m_tilde_u = clip(m_u + eps_u, 0, 1)
+            eps_u ~ Uniform(-cf_delta, +cf_delta)
+
+        Validation/test:
+            m_tilde_u = m_u
+
+        Important:
+            The noise is NOT detached from m_u. Gradients still flow
+            through m_u into user_mask_logits via the standard BPR loss.
+            The random noise itself has no learnable parameters.
+        """
+        base_user_mask = self.get_user_mask()
+
+        # Deterministic behavior for validation/test or delta=0.
+        if (
+            (not self.training)
+            or self.cf_delta <= 0.0
+            or self.cf_apply_prob <= 0.0
+        ):
+            sampled_user_mask = base_user_mask
+            noise = torch.zeros_like(base_user_mask)
+
+        else:
+            # Optionally skip the intervention for the whole graph on
+            # some steps. For the main experiment use cf_apply_prob=1.
+            apply_cf = True
+            if self.cf_apply_prob < 1.0:
+                apply_cf = (
+                    torch.rand(
+                        (),
+                        device=base_user_mask.device
+                    ).item()
+                    < self.cf_apply_prob
+                )
+
+            if apply_cf:
+                noise = (
+                    2.0 * torch.rand_like(base_user_mask)
+                    - 1.0
+                ) * self.cf_delta
+
+                sampled_user_mask = torch.clamp(
+                    base_user_mask + noise,
+                    min=0.0,
+                    max=1.0
+                )
+            else:
+                noise = torch.zeros_like(base_user_mask)
+                sampled_user_mask = base_user_mask
+
+        # Diagnostics only. Detach so these do not hold computation graphs.
+        self.last_base_user_mask = base_user_mask.detach()
+        self.last_sampled_user_mask = sampled_user_mask.detach()
+        self.last_cf_noise = noise.detach()
+
+        return sampled_user_mask
 
     def get_original_edge_mask(self, user_mask=None):
         """
         Expand user-level scalar masks to the original user-item edges.
 
-        For every original interaction edge e=(u,i):
+        For original edge e=(u,i):
             edge_mask[e] = user_mask[u]
+
+        If user_mask is omitted, use the deterministic learned mask.
         """
         if user_mask is None:
             user_mask = self.get_user_mask()
+
         return user_mask[self.edge_user_ids]
-
-    def _make_undirected_edge_mask(self, user_mask):
-        """
-        Convert a user-level mask [num_users] into an edge mask for
-        self.edge_index = [original_edges, reverse_edges].
-        """
-        original_edge_mask = self.get_original_edge_mask(user_mask)
-        return torch.cat(
-            [original_edge_mask, original_edge_mask],
-            dim=0
-        )
-
-    def _run_masked_world(self, user_mask):
-        """
-        Run the masked GCN under a specified user-level intervention.
-
-        user_mask[u] controls the strength of ALL interaction messages
-        incident to user u in the masked branch.
-        """
-        edge_mask = self._make_undirected_edge_mask(user_mask)
-
-        mask_rep, mask_preference = self.mask_gcn(
-            self.edge_index,
-            self.id_embedding_masked.weight,
-            edge_mask=edge_mask
-        )
-
-        return mask_rep, mask_preference
-
-    def _build_result_embedding(self, full_rep, mask_rep):
-        """
-        Preserve the original fusion exactly:
-            user = [full_user || masked_user]
-            item = item-item-propagation([full_item || masked_item])
-        """
-        item_full = full_rep[self.num_user:]
-        item_mask = mask_rep[self.num_user:]
-
-        item_rep = torch.cat(
-            (item_full, item_mask),
-            dim=1
-        )
-        item_rep = self.item_item(item_rep)
-
-        user_full = full_rep[:self.num_user]
-        user_mask = mask_rep[:self.num_user]
-
-        user_rep = torch.cat(
-            (user_full, user_mask),
-            dim=1
-        )
-
-        return torch.cat(
-            (user_rep, item_rep),
-            dim=0
-        )
-
-    def _score_result_embedding(
-        self,
-        result_embed,
-        user_nodes,
-        pos_item_nodes,
-        neg_item_nodes
-    ):
-        user_tensor = result_embed[user_nodes]
-        pos_item_tensor = result_embed[pos_item_nodes]
-        neg_item_tensor = result_embed[neg_item_nodes]
-
-        pos_scores = torch.sum(
-            user_tensor * pos_item_tensor,
-            dim=1
-        )
-        neg_scores = torch.sum(
-            user_tensor * neg_item_tensor,
-            dim=1
-        )
-
-        return pos_scores, neg_scores
-
-    @staticmethod
-    def _bpr_per_sample(pos_scores, neg_scores):
-        """
-        Per-sample BPR loss.
-
-        This matches the monotonic objective used by the original code,
-        but keeps the individual losses so that we can compare factual
-        and counterfactual responses user-by-user.
-        """
-        margin = pos_scores - neg_scores
-        return -torch.log2(
-            torch.sigmoid(margin).clamp_min(1e-12)
-        )
 
     @torch.no_grad()
     def get_user_mask_statistics(self):
+        """Diagnostics for the deterministic learned user-level mask."""
         user_mask = self.get_user_mask().detach()
 
         return {
@@ -1194,456 +1173,175 @@ class MASKED_GLORIA_EX(GeneralRecommender):
             'std_keep': user_mask.std(unbiased=False).item(),
         }
 
+    @torch.no_grad()
+    def get_counterfactual_statistics(self):
+        """
+        Diagnostics for the most recently sampled training world.
+        """
+        if (
+            self.last_base_user_mask is None
+            or self.last_sampled_user_mask is None
+        ):
+            return {}
+
+        base = self.last_base_user_mask
+        sampled = self.last_sampled_user_mask
+        difference = sampled - base
+
+        return {
+            'cf_delta': float(self.cf_delta),
+            'mean_base_keep': base.mean().item(),
+            'mean_sampled_keep': sampled.mean().item(),
+            'mean_abs_intervention': difference.abs().mean().item(),
+            'mean_signed_intervention': difference.mean().item(),
+            'fraction_more_compressed': (difference < 0).float().mean().item(),
+            'fraction_less_compressed': (difference > 0).float().mean().item(),
+            'fraction_unchanged': (difference == 0).float().mean().item(),
+            'sampled_min_keep': sampled.min().item(),
+            'sampled_max_keep': sampled.max().item(),
+        }
+
     def forward(self, interaction):
+        if self.training:
+            # Parameters may be updated after this training forward, so
+            # any deterministic evaluation cache must be considered stale.
+            self._deterministic_eval_cache_valid = False
+
         user_nodes = interaction[0]
         pos_item_nodes = interaction[1] + self.n_users
         neg_item_nodes = interaction[2] + self.n_users
 
-        # ============================================================
-        # 1. Full factual graph branch
-        # ============================================================
+        # item_feat = self.mlp_item(self.t_feat)
+        # user_feat = F.normalize(self.mlp_user(self.user_feat))
+        
+        # self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index, self.id_embedding_low.weight)
+        # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
+
         self.full_rep, self.full_preference = self.full_gcn(
-            self.edge_index,
-            self.id_embedding_full.weight
-        )
+                                                self.edge_index,
+                                                self.id_embedding_full.weight
+                                            )
 
         # ============================================================
-        # 2. Learned user-level neighborhood-strength branch
+        # User-level scalar mask
         # ============================================================
-        user_mask = self.get_user_mask()
+        # user_mask: [num_user]
+        # mask:      [num_interactions]
+        #
+        # Every interaction edge of the same user receives the same
+        # learned scalar weight.
+        # During training this samples one stochastic local
+        # counterfactual neighborhood-strength world.
+        #
+        # During validation/test get_training_user_mask() automatically
+        # returns the deterministic learned user mask.
+        user_mask = self.get_training_user_mask()
+        mask = user_mask[self.edge_user_ids]
 
-        self.mask_rep, self.mask_preference = self._run_masked_world(
-            user_mask
+        # self.edge_index = original edges + reverse edges.
+        # Use the same user-conditioned mask in both directions.
+        edge_mask = torch.cat(
+            [mask, mask],
+            dim=0
         )
 
-        # ============================================================
-        # 3. Original fusion and prediction
-        # ============================================================
-        self.result_embed = self._build_result_embedding(
-            self.full_rep,
-            self.mask_rep
-        )
+        self.mask_rep, self.mask_preference = self.mask_gcn(
+                                                self.edge_index,
+                                                self.id_embedding_masked.weight,
+                                                edge_mask=edge_mask
+                                            )
 
-        pos_scores, neg_scores = self._score_result_embedding(
-            self.result_embed,
-            user_nodes,
-            pos_item_nodes,
-            neg_item_nodes
-        )
+        item_repl = self.full_rep[self.num_user:]
+        item_reph = self.mask_rep[self.num_user:]
 
+        item_rep = torch.cat((item_repl, item_reph), dim=1)
+        item_rep = self.item_item(item_rep)
+
+        user_repl = self.full_rep[:self.num_user]
+        user_reph = self.mask_rep[:self.num_user]
+
+        user_rep = torch.cat((user_repl, user_reph), dim=1)
+
+        self.result_embed = torch.cat((user_rep, item_rep), dim=0)
+        user_tensor = self.result_embed[user_nodes]
+        pos_item_tensor = self.result_embed[pos_item_nodes]
+        neg_item_tensor = self.result_embed[neg_item_nodes]
+        pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
+        neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
         return pos_scores, neg_scores
-
-    def _counterfactual_response_loss(
-        self,
-        interaction,
-        factual_per_sample_loss
-    ):
-        """
-        Counterfactual Neighborhood Response Learning.
-
-        For users appearing in the current mini-batch, probe:
-            factual: m_u
-            minus:   m_u - delta  (more compression)
-            plus:    m_u + delta  (less compression)
-
-        The two counterfactual worlds are DETACHED probes: they do not
-        backpropagate through GCN parameters. Their only role is to tell
-        us which local intervention direction seems better.
-
-        Then create a pseudo-target for each active user's scalar mask:
-            target = m_u - delta  if more compression is better
-            target = m_u + delta  if less compression is better
-            target = m_u          if factual is already best / stable
-
-        A Smooth-L1 response loss moves only the learnable user scalar
-        toward that local counterfactual target.
-        """
-        user_nodes = interaction[0]
-        pos_item_nodes = interaction[1] + self.n_users
-        neg_item_nodes = interaction[2] + self.n_users
-
-        unique_users, inverse = torch.unique(
-            user_nodes,
-            sorted=False,
-            return_inverse=True
-        )
-
-        # Current learned mask remains differentiable for the final
-        # response loss. Counterfactual probe masks are detached.
-        current_user_mask = self.get_user_mask()
-        current_active_mask = current_user_mask[unique_users]
-
-        with torch.no_grad():
-            factual_mask_detached = current_user_mask.detach()
-
-            # --------------------------------------------------------
-            # Local intervention: only users in this batch are changed.
-            # All other users remain at their learned factual masks.
-            # --------------------------------------------------------
-            minus_user_mask = factual_mask_detached.clone()
-            plus_user_mask = factual_mask_detached.clone()
-
-            minus_user_mask[unique_users] = torch.clamp(
-                factual_mask_detached[unique_users] - self.cf_delta,
-                min=0.0,
-                max=1.0
-            )
-
-            plus_user_mask[unique_users] = torch.clamp(
-                factual_mask_detached[unique_users] + self.cf_delta,
-                min=0.0,
-                max=1.0
-            )
-
-            # More-compression counterfactual world.
-            minus_mask_rep, _ = self._run_masked_world(
-                minus_user_mask
-            )
-            minus_result_embed = self._build_result_embedding(
-                self.full_rep.detach(),
-                minus_mask_rep
-            )
-            minus_pos, minus_neg = self._score_result_embedding(
-                minus_result_embed,
-                user_nodes,
-                pos_item_nodes,
-                neg_item_nodes
-            )
-            minus_loss = self._bpr_per_sample(
-                minus_pos,
-                minus_neg
-            )
-
-            # Less-compression counterfactual world.
-            plus_mask_rep, _ = self._run_masked_world(
-                plus_user_mask
-            )
-            plus_result_embed = self._build_result_embedding(
-                self.full_rep.detach(),
-                plus_mask_rep
-            )
-            plus_pos, plus_neg = self._score_result_embedding(
-                plus_result_embed,
-                user_nodes,
-                pos_item_nodes,
-                neg_item_nodes
-            )
-            plus_loss = self._bpr_per_sample(
-                plus_pos,
-                plus_neg
-            )
-
-            factual_loss = factual_per_sample_loss.detach()
-
-            # --------------------------------------------------------
-            # Determine the locally best world PER TRAINING SAMPLE.
-            #
-            # Index:
-            #   0 -> m - delta : more compression
-            #   1 -> m         : factual/stable
-            #   2 -> m + delta : less compression
-            # --------------------------------------------------------
-            all_losses = torch.stack(
-                [minus_loss, factual_loss, plus_loss],
-                dim=1
-            )
-
-            best_world = torch.argmin(
-                all_losses,
-                dim=1
-            )
-
-            best_cf_loss = torch.minimum(
-                minus_loss,
-                plus_loss
-            )
-
-            improvement = (
-                factual_loss - best_cf_loss
-            ).clamp_min(0.0)
-
-            # Do not react to tiny/noisy improvements if a threshold
-            # is requested.
-            has_useful_cf = (
-                improvement > self.cf_min_improvement
-            )
-
-            sample_direction = torch.zeros_like(
-                factual_loss
-            )
-
-            # -1 = move m down = MORE compression
-            sample_direction[
-                (best_world == 0) & has_useful_cf
-            ] = -1.0
-
-            # +1 = move m up = LESS compression
-            sample_direction[
-                (best_world == 2) & has_useful_cf
-            ] = 1.0
-
-            # --------------------------------------------------------
-            # Aggregate sample-level responses into one response per
-            # unique user in this batch.
-            #
-            # If a user has contradictory samples, the mean direction
-            # naturally moves toward zero (stable).
-            # --------------------------------------------------------
-            direction_sum = torch.zeros(
-                unique_users.numel(),
-                device=user_nodes.device,
-                dtype=factual_loss.dtype
-            )
-            count = torch.zeros_like(
-                direction_sum
-            )
-            improvement_sum = torch.zeros_like(
-                direction_sum
-            )
-
-            direction_sum.index_add_(
-                0,
-                inverse,
-                sample_direction
-            )
-            improvement_sum.index_add_(
-                0,
-                inverse,
-                improvement
-            )
-            count.index_add_(
-                0,
-                inverse,
-                torch.ones_like(sample_direction)
-            )
-
-            mean_direction = (
-                direction_sum
-                / count.clamp_min(1.0)
-            )
-
-            mean_improvement = (
-                improvement_sum
-                / count.clamp_min(1.0)
-            )
-
-            # Counterfactual pseudo-target.
-            target_active_mask = torch.clamp(
-                current_active_mask.detach()
-                + self.cf_delta * mean_direction,
-                min=0.0,
-                max=1.0
-            )
-
-        # ------------------------------------------------------------
-        # Only this small loss backpropagates from the CF experiment.
-        # It updates user_mask_logits toward the locally better
-        # neighborhood-strength intervention.
-        # ------------------------------------------------------------
-        response_loss = F.smooth_l1_loss(
-            current_active_mask,
-            target_active_mask
-        )
-
-        with torch.no_grad():
-            eps = 1e-8
-
-            more = (
-                mean_direction < -eps
-            ).float().mean().item()
-
-            less = (
-                mean_direction > eps
-            ).float().mean().item()
-
-            stable = (
-                mean_direction.abs() <= eps
-            ).float().mean().item()
-
-            self.cf_last_stats = {
-                'response_loss': float(response_loss.detach().item()),
-                'fraction_more_compression': float(more),
-                'fraction_less_compression': float(less),
-                'fraction_stable': float(stable),
-                'mean_counterfactual_improvement': float(
-                    mean_improvement.mean().item()
-                ),
-                'mean_direction': float(
-                    mean_direction.mean().item()
-                ),
-            }
-
-        return response_loss
 
     def calculate_loss(self, interaction):
         pos_scores, neg_scores = self.forward(interaction)
-
-        factual_per_sample_loss = self._bpr_per_sample(
-            pos_scores,
-            neg_scores
-        )
-
-        main_loss = factual_per_sample_loss.mean()
-
-        # ------------------------------------------------------------
-        # Optional counterfactual response learning.
-        #
-        # interval=1 -> probe every training step.
-        # interval=5 -> probe every 5th step to reduce cost.
-        # ------------------------------------------------------------
-        response_loss = main_loss.new_zeros(())
-
-        use_cf_step = (
-            self.training
-            and self.cf_response_weight > 0.0
-            and self.cf_response_interval > 0
-            and (
-                self._cf_train_step
-                % self.cf_response_interval
-                == 0
-            )
-        )
-
-        if use_cf_step:
-            response_loss = self._counterfactual_response_loss(
-                interaction,
-                factual_per_sample_loss
-            )
-
-        self._cf_train_step += 1
-
-        total_loss = (
-            main_loss
-            + self.cf_response_weight * response_loss
-        )
-
-        return total_loss
+        loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
+        return loss_value
 
     @torch.no_grad()
-    def probe_counterfactual_response(self, interaction, delta=None):
+    def recompute_deterministic_result_embedding(self):
         """
-        Analysis helper.
-
-        Returns per-sample ranking losses under:
-            m_u - delta
-            m_u
-            m_u + delta
-
-        This does NOT update parameters and is useful for plotting
-        counterfactual response distributions after training.
+        Recompute result embeddings with the deterministic learned
+        user mask. Useful before validation/test if the trainer does not
+        automatically call forward() in eval mode.
         """
-        if delta is None:
-            delta = self.cf_delta
-
-        user_nodes = interaction[0]
-        pos_item_nodes = interaction[1] + self.n_users
-        neg_item_nodes = interaction[2] + self.n_users
-
-        # Recompute factual representations for a self-contained probe.
         full_rep, _ = self.full_gcn(
             self.edge_index,
             self.id_embedding_full.weight
         )
 
-        factual_user_mask = self.get_user_mask().detach()
-
-        factual_mask_rep, _ = self._run_masked_world(
-            factual_user_mask
+        deterministic_user_mask = self.get_user_mask()
+        deterministic_edge_mask = self.get_original_edge_mask(
+            deterministic_user_mask
         )
-        factual_result = self._build_result_embedding(
-            full_rep,
-            factual_mask_rep
-        )
-        factual_pos, factual_neg = self._score_result_embedding(
-            factual_result,
-            user_nodes,
-            pos_item_nodes,
-            neg_item_nodes
-        )
-        factual_loss = self._bpr_per_sample(
-            factual_pos,
-            factual_neg
+        deterministic_edge_mask = torch.cat(
+            [deterministic_edge_mask, deterministic_edge_mask],
+            dim=0
         )
 
-        unique_users = torch.unique(
-            user_nodes,
-            sorted=False
+        mask_rep, _ = self.mask_gcn(
+            self.edge_index,
+            self.id_embedding_masked.weight,
+            edge_mask=deterministic_edge_mask
         )
 
-        minus_user_mask = factual_user_mask.clone()
-        plus_user_mask = factual_user_mask.clone()
+        item_full = full_rep[self.num_user:]
+        item_mask = mask_rep[self.num_user:]
 
-        minus_user_mask[unique_users] = torch.clamp(
-            factual_user_mask[unique_users] - delta,
-            0.0,
-            1.0
+        item_rep = torch.cat(
+            (item_full, item_mask),
+            dim=1
         )
-        plus_user_mask[unique_users] = torch.clamp(
-            factual_user_mask[unique_users] + delta,
-            0.0,
-            1.0
-        )
+        item_rep = self.item_item(item_rep)
 
-        minus_rep, _ = self._run_masked_world(
-            minus_user_mask
-        )
-        minus_result = self._build_result_embedding(
-            full_rep,
-            minus_rep
-        )
-        minus_pos, minus_neg = self._score_result_embedding(
-            minus_result,
-            user_nodes,
-            pos_item_nodes,
-            neg_item_nodes
-        )
-        minus_loss = self._bpr_per_sample(
-            minus_pos,
-            minus_neg
+        user_full = full_rep[:self.num_user]
+        user_mask_rep = mask_rep[:self.num_user]
+
+        user_rep = torch.cat(
+            (user_full, user_mask_rep),
+            dim=1
         )
 
-        plus_rep, _ = self._run_masked_world(
-            plus_user_mask
-        )
-        plus_result = self._build_result_embedding(
-            full_rep,
-            plus_rep
-        )
-        plus_pos, plus_neg = self._score_result_embedding(
-            plus_result,
-            user_nodes,
-            pos_item_nodes,
-            neg_item_nodes
-        )
-        plus_loss = self._bpr_per_sample(
-            plus_pos,
-            plus_neg
+        self.full_rep = full_rep
+        self.mask_rep = mask_rep
+        self.result_embed = torch.cat(
+            (user_rep, item_rep),
+            dim=0
         )
 
-        return {
-            'user_nodes': user_nodes.detach(),
-            'factual_mask': factual_user_mask[user_nodes].detach(),
-            'minus_loss': minus_loss.detach(),
-            'factual_loss': factual_loss.detach(),
-            'plus_loss': plus_loss.detach(),
-            'minus_margin': (minus_pos - minus_neg).detach(),
-            'factual_margin': (factual_pos - factual_neg).detach(),
-            'plus_margin': (plus_pos - plus_neg).detach(),
-        }
-
-    def get_cf_response_statistics(self):
-        """Return diagnostics from the latest CF-response training step."""
-        return dict(self.cf_last_stats)
+        self._deterministic_eval_cache_valid = True
+        return self.result_embed
 
     def full_sort_predict(self, interaction):
+        # Training uses stochastic counterfactual masks, but ranking
+        # evaluation should always use the learned deterministic mask.
+        #
+        # Recompute once after the latest training phase, then reuse the
+        # deterministic cache for the remaining evaluation batches.
+        if not self._deterministic_eval_cache_valid:
+            self.recompute_deterministic_result_embedding()
         user_tensor = self.result_embed[:self.n_users]
         item_tensor = self.result_embed[self.n_users:]
 
         temp_user_tensor = user_tensor[interaction[0], :]
-        score_matrix = torch.matmul(
-            temp_user_tensor,
-            item_tensor.t()
-        )
+        score_matrix = torch.matmul(temp_user_tensor, item_tensor.t())
         return score_matrix
 
 class GCN(torch.nn.Module):
@@ -1735,5 +1433,3 @@ class Base_gcn(MessagePassing):
 
     def __repr(self):
         return '{}({},{})'.format(self.__class__.__name__, self.in_channels, self.out_channels)
-
-
