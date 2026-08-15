@@ -49,8 +49,6 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         self.mm_adj = None
         self.config = config
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
-
-        self.lambda_cf = 0.01
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
@@ -254,56 +252,25 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         neg_item_tensor = self.result_embed[neg_item_nodes]
         pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
         neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
-
-
-        pos_item_local = pos_item_nodes - self.num_user
-        neg_item_local = neg_item_nodes - self.num_user
-
-        cf_user = user_reph[user_nodes]
-
-        cf_pos_item = item_reph[pos_item_local]
-        cf_neg_item = item_reph[neg_item_local]
-
-        cf_pos_scores = torch.sum(
-            cf_user * cf_pos_item,
-            dim=1
-        )
-
-        cf_neg_scores = torch.sum(
-            cf_user * cf_neg_item,
-            dim=1
-        )
-
-        return (
-            pos_scores,
-            neg_scores,
-            cf_pos_scores,
-            cf_neg_scores
-        )
+        return pos_scores, neg_scores
 
     def calculate_loss(self, interaction):
-        (
-        pos_scores,
-        neg_scores,
-        cf_pos_scores,
-        cf_neg_scores
-        ) = self.forward(interaction)
-        main_loss = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores))) + 1e-8
+        pos_scores, neg_scores = self.forward(interaction)
+        bpr_loss = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
 
-         # Counterfactual / masked branch BPR
-        cf_loss = -torch.mean(
-            torch.log2(
-                torch.sigmoid(
-                    cf_pos_scores - cf_neg_scores
-                ) + 1e-8
-            )
+        mask = torch.sigmoid(
+        self.mask_logits
         )
+        self.lambda_cf = 0.1
+
+        cf_mask_loss = (
+            1.0 - mask
+        ).mean()
 
         loss = (
-            main_loss
-            + self.lambda_cf * cf_loss
+            bpr_loss
+            + self.lambda_cf * cf_mask_loss
         )
-        
         return loss
 
     def full_sort_predict(self, interaction):
