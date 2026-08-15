@@ -110,7 +110,7 @@ class MASKED_GLORIA_EX(GeneralRecommender):
 
         # Optional auxiliary BPR loss on the masked/counterfactual branch.
         # Set cf_bpr_weight = 0.0 to test the gate alone.
-        self.cf_bpr_weight = float(config.get('cf_bpr_weight', 0.0))
+        self.cf_bpr_weight = float(0.0)
 
         edge_index = self.pack_edge_index(train_interactions)
 
