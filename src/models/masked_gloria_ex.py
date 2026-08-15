@@ -87,15 +87,15 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         #
         # Config defaults are deliberately mild so that the model remains
         # close to the original deterministic learnable-mask baseline.
-        self.use_stochastic_mask = bool(config.get('use_stochastic_mask', False))
-        self.mask_temperature = float(config.get('mask_temperature', 0.67))
-        self.hard_stochastic_mask = bool(config.get('hard_stochastic_mask', False))
-        self.mask_budget_weight = float(config.get('mask_budget_weight', 0.0))
-        self.mask_binary_weight = float(config.get('mask_binary_weight', 0.0))
-        self.mask_budget_min = float(config.get('mask_budget_min', 0.0))
-        self.mask_budget_max = float(config.get('mask_budget_max', 0.15))
-        self.mask_budget_gamma = float(config.get('mask_budget_gamma', 1.0))
-        self.mask_init_keep_prob = float(config.get('mask_init_keep_prob', 0.50))
+        self.use_stochastic_mask = True
+        self.mask_temperature = float(0.67)
+        self.hard_stochastic_mask = bool(False)
+        self.mask_budget_weight = float(1.0)
+        self.mask_binary_weight = float(0.0)
+        self.mask_budget_min = float(0.0)
+        self.mask_budget_max = float(0.15)
+        self.mask_budget_gamma = float(1.0)
+        self.mask_init_keep_prob = float(0.50)
 
         init_p = min(max(self.mask_init_keep_prob, 1e-4), 1.0 - 1e-4)
         init_logit = math.log(init_p / (1.0 - init_p))
