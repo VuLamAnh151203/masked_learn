@@ -49,6 +49,7 @@ class MASKED_GLORIA(GeneralRecommender):
         self.mm_adj = None
         self.config = config
         dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
+        self.orthogonal_loss = 1e-3
         
         mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
 
@@ -206,6 +207,10 @@ class MASKED_GLORIA(GeneralRecommender):
             h = torch.sparse.mm(self.mm_adj, h)
         return rep + h
 
+    def orthogonal_loss(self, rep_1, rep_2):
+        cosine_sim = F.cosine_similarity(rep_1, rep_2, dim=1)
+        return cosine_sim.abs().mean()
+
     def forward(self, interaction):
         user_nodes, pos_item_nodes, neg_item_nodes = interaction[0], interaction[1], interaction[2]
         pos_item_nodes += self.n_users
@@ -235,16 +240,21 @@ class MASKED_GLORIA(GeneralRecommender):
                                                 edge_mask=edge_mask
                                             )
 
-        item_repl = self.full_rep[self.num_user:]
-        item_reph = self.mask_rep[self.num_user:]
+        item_repf = self.full_rep[self.num_user:]
+        item_repm = self.mask_rep[self.num_user:]
 
-        item_rep = torch.cat((item_repl, item_reph), dim=1)
+        # item_rep = torch.cat((item_repf, item_repm), dim=1)
+        item_rep_suprious = item_repf - item_repm
+        item_rep = torch.cat((item_repm, item_rep_suprious), dim=1)
         item_rep = self.item_item(item_rep)
 
-        user_repl = self.full_rep[:self.num_user]
-        user_reph = self.mask_rep[:self.num_user]
+        user_repf = self.full_rep[:self.num_user]
+        user_repm = self.mask_rep[:self.num_user]
 
-        user_rep = torch.cat((user_repl, user_reph), dim=1)
+        user_rep_suprious = user_repf - user_repm
+
+        # user_rep = torch.cat((user_repf, user_repm), dim=1)
+        user_rep = torch.cat((user_repm, user_rep_suprious), dim=1)
 
         self.result_embed = torch.cat((user_rep, item_rep), dim=0)
         user_tensor = self.result_embed[user_nodes]
@@ -252,12 +262,30 @@ class MASKED_GLORIA(GeneralRecommender):
         neg_item_tensor = self.result_embed[neg_item_nodes]
         pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
         neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
-        return pos_scores, neg_scores
+
+
+        ## Orthogonal loss
+        user_orth_loss = self.orthogonal_loss(
+            user_repm,
+            user_rep_suprious
+        )
+
+        item_orth_loss = self.orthogonal_loss(
+            item_repm,
+            item_rep_suprious
+        )
+
+        orthogonal_loss = (user_orth_loss + item_orth_loss) / 2.0
+        return pos_scores, neg_scores, orthogonal_loss
 
     def calculate_loss(self, interaction):
-        pos_scores, neg_scores = self.forward(interaction)
+        pos_scores, neg_scores, orthogonal_loss = self.forward(interaction)
         loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
-        return loss_value
+
+        lambda_orth = self.lambda_orth
+        loss = (loss_value + lambda_orth * orthogonal_loss)
+        # return loss_value
+        return loss
 
     def full_sort_predict(self, interaction):
         user_tensor = self.result_embed[:self.n_users]
