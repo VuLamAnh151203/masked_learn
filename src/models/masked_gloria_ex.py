@@ -65,25 +65,58 @@ class MASKED_GLORIA_EX(GeneralRecommender):
 
         train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
 
+        # ============================================================
+        # Original user-item edges (one direction only)
+        # ============================================================
         edge_index = self.pack_edge_index(train_interactions)
-
         self.num_interactions = edge_index.shape[0]
 
-        edge_index = torch.tensor(edge_index, 
-                                  dtype=torch.long,
-                                  device = self.device).t().contiguous()
+        # edge_user_ids[e] tells us which user owns original edge e.
+        # Shape: [num_interactions]
+        #
+        # User-level scalar mask:
+        #     M_(u,i) = sigmoid(user_mask_logits[u])
+        self.register_buffer(
+            'edge_user_ids',
+            torch.tensor(
+                edge_index[:, 0],
+                dtype=torch.long,
+                device=self.device
+            )
+        )
 
+        edge_index = torch.tensor(
+            edge_index,
+            dtype=torch.long,
+            device=self.device
+        ).t().contiguous()
+
+        # Keep the same undirected interaction graph as the original code.
         self.edge_index = torch.cat(
-                            [edge_index, edge_index[[1, 0]]],
-                            dim=1
-                        )
+            [edge_index, edge_index[[1, 0]]],
+            dim=1
+        )
 
-        self.mask_logits = nn.Parameter(
-                            torch.zeros(
-                                self.num_interactions,
-                                device=self.device
-                            )
-                        )
+        # ============================================================
+        # USER-LEVEL LEARNABLE SCALAR MASK
+        # ============================================================
+        # Original:
+        #     one learnable logit per interaction edge -> O(|E|)
+        #
+        # Here:
+        #     one learnable logit per user -> O(|U|)
+        #
+        # All interaction edges of user u receive the same scalar:
+        #     m_u = sigmoid(user_mask_logits[u])
+        #
+        # Initialize at zero so sigmoid(0)=0.5, matching the original
+        # edge-level mask initialization for a clean ablation.
+        self.user_mask_logits = nn.Parameter(
+            torch.zeros(
+                self.num_user,
+                device=self.device
+            )
+        )
 
         edge_index = self.pack_edge_index(train_interactions)
 
@@ -206,10 +239,36 @@ class MASKED_GLORIA_EX(GeneralRecommender):
             h = torch.sparse.mm(self.mm_adj, h)
         return rep + h
 
+    def get_user_mask(self):
+        """Return one learned scalar mask value for each user."""
+        return torch.sigmoid(self.user_mask_logits)
+
+    def get_original_edge_mask(self):
+        """
+        Expand user-level scalar masks to the original user-item edges.
+
+        For original edge e=(u,i):
+            edge_mask[e] = sigmoid(user_mask_logits[u])
+        """
+        user_mask = self.get_user_mask()
+        return user_mask[self.edge_user_ids]
+
+    @torch.no_grad()
+    def get_user_mask_statistics(self):
+        """Diagnostics for the learned user-level mask."""
+        user_mask = self.get_user_mask().detach()
+        return {
+            'mean_keep': user_mask.mean().item(),
+            'mean_attenuation': (1.0 - user_mask).mean().item(),
+            'min_keep': user_mask.min().item(),
+            'max_keep': user_mask.max().item(),
+            'std_keep': user_mask.std(unbiased=False).item(),
+        }
+
     def forward(self, interaction):
-        user_nodes, pos_item_nodes, neg_item_nodes = interaction[0], interaction[1], interaction[2]
-        pos_item_nodes += self.n_users
-        neg_item_nodes += self.n_users
+        user_nodes = interaction[0]
+        pos_item_nodes = interaction[1] + self.n_users
+        neg_item_nodes = interaction[2] + self.n_users
 
         # item_feat = self.mlp_item(self.t_feat)
         # user_feat = F.normalize(self.mlp_user(self.user_feat))
@@ -222,12 +281,23 @@ class MASKED_GLORIA_EX(GeneralRecommender):
                                                 self.id_embedding_full.weight
                                             )
 
-        mask = torch.sigmoid(self.mask_logits)
+        # ============================================================
+        # User-level scalar mask
+        # ============================================================
+        # user_mask: [num_user]
+        # mask:      [num_interactions]
+        #
+        # Every interaction edge of the same user receives the same
+        # learned scalar weight.
+        user_mask = self.get_user_mask()
+        mask = user_mask[self.edge_user_ids]
 
+        # self.edge_index = original edges + reverse edges.
+        # Use the same user-conditioned mask in both directions.
         edge_mask = torch.cat(
-                        [mask, mask],
-                        dim=0
-                    )
+            [mask, mask],
+            dim=0
+        )
 
         self.mask_rep, self.mask_preference = self.mask_gcn(
                                                 self.edge_index,
@@ -256,22 +326,8 @@ class MASKED_GLORIA_EX(GeneralRecommender):
 
     def calculate_loss(self, interaction):
         pos_scores, neg_scores = self.forward(interaction)
-        bpr_loss = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
-
-        mask = torch.sigmoid(
-        self.mask_logits
-        )
-        self.lambda_cf = 0.1
-
-        cf_mask_loss = (
-            1.0 - mask
-        ).mean()
-
-        loss = (
-            bpr_loss
-            + self.lambda_cf * cf_mask_loss
-        )
-        return loss
+        loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
+        return loss_value
 
     def full_sort_predict(self, interaction):
         user_tensor = self.result_embed[:self.n_users]

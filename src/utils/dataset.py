@@ -33,6 +33,7 @@ class RecDataset(object):
 
         if df is not None:
             self.df = df
+            self.inter_num = len(self.df)
             return
         # if all files exists
         check_file_list = [self.config['inter_file_name']]
@@ -45,6 +46,7 @@ class RecDataset(object):
 
         # load rating file from data path?
         self.load_inter_graph(config['inter_file_name'])
+        self.inter_num = len(self.df)
         self.item_num = int(max(self.df[self.iid_field].values)) + 1
         self.user_num = int(max(self.df[self.uid_field].values)) + 1
 
