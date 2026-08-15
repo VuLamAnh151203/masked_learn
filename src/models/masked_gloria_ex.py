@@ -937,10 +937,10 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         #   - Counterfactual GCN passes are used as detached probes.
         #   - Only the user-mask scalar receives the response loss.
         #   - The original recommendation BPR still trains the full model.
-        self.cf_delta = float(config.get('cf_delta', 0.10))
-        self.cf_response_weight = float(config.get('cf_response_weight', 0.01))
-        self.cf_min_improvement = float(config.get('cf_min_improvement', 0.0))
-        self.cf_response_interval = int(config.get('cf_response_interval', 1))
+        self.cf_delta = float(0.10)
+        self.cf_response_weight = float(0.01)
+        self.cf_min_improvement = float(0.0)
+        self.cf_response_interval = int(1)
 
         # Internal counter used only to optionally reduce training cost.
         self._cf_train_step = 0
