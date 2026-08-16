@@ -14,9 +14,9 @@ from common.init import xavier_uniform_initialization
 from torch.nn import MultiheadAttention
 # from .transformer import TransformerEncoder
 
-class MASKED_GLORIA_EX(GeneralRecommender):
+class MASKED_GLORIA_EX4(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MASKED_GLORIA_EX, self).__init__(config, dataset)
+        super(MASKED_GLORIA_EX4, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
