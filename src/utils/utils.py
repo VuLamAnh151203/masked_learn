@@ -42,8 +42,11 @@ def get_model(model_name):
     return model_class
 
 
-def get_trainer():
-    return getattr(importlib.import_module('common.trainer'), 'Trainer')
+def get_trainer(model_name=None):
+    trainer_name = 'Trainer'
+    if model_name is not None and str(model_name).upper() == 'MASKED_GLORIA_EX3':
+        trainer_name = 'CounterfactualCalibrationTrainer'
+    return getattr(importlib.import_module('common.trainer'), trainer_name)
 
 
 def init_seed(seed):

@@ -75,7 +75,7 @@ def quick_start(model, dataset, config_dict, save_model=True):
         logger.info(model)
 
         # trainer loading and initialization
-        trainer = get_trainer()(config, model)
+        trainer = get_trainer(config['model'])(config, model)
         # debug
         # model training
         best_valid_score, best_valid_result, best_test_upon_valid = trainer.fit(train_data, valid_data=valid_data, test_data=test_data, saved=save_model)

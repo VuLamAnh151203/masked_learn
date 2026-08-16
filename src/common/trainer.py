@@ -10,6 +10,7 @@ import itertools
 import torch
 import torch.optim as optim
 from torch.nn.utils.clip_grad import clip_grad_norm_
+from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -377,4 +378,258 @@ class Trainer(AbstractTrainer):
             plt.show()
         if save_path:
             plt.savefig(save_path)
+
+
+class CounterfactualCalibrationTrainer(Trainer):
+    """Train only the MASKED_GLORIA_EX3 per-user gamma calibrator."""
+
+    def __init__(self, config, model):
+        super(CounterfactualCalibrationTrainer, self).__init__(config, model)
+        epochs = config['cf_calibrator_epochs']
+        patience = config['cf_calibrator_patience']
+        batch_size = config['cf_calibrator_batch_size']
+        self.calibrator_epochs = int(
+            200 if epochs is None else epochs
+        )
+        self.calibrator_patience = int(
+            20 if patience is None else patience
+        )
+        self.calibrator_batch_size = int(
+            512 if batch_size is None else batch_size
+        )
+
+        if self.calibrator_epochs <= 0:
+            raise ValueError('cf_calibrator_epochs must be positive.')
+        if self.calibrator_patience <= 0:
+            raise ValueError('cf_calibrator_patience must be positive.')
+        if self.calibrator_batch_size <= 0:
+            raise ValueError('cf_calibrator_batch_size must be positive.')
+
+    def _build_optimizer(self):
+        trainable_parameters = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise ValueError('The EX3 calibrator has no trainable parameters.')
+
+        unexpected_trainable = [
+            name
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad and not name.startswith('calibrator.')
+        ]
+        if unexpected_trainable:
+            raise RuntimeError(
+                'Only calibrator parameters may be trainable; found {}.'.format(
+                    unexpected_trainable
+                )
+            )
+
+        configured_learning_rate = self.config['cf_calibrator_lr']
+        learning_rate = float(
+            1e-3
+            if configured_learning_rate is None
+            else configured_learning_rate
+        )
+        if learning_rate <= 0.0:
+            raise ValueError('cf_calibrator_lr must be positive.')
+        return optim.Adam(trainable_parameters, lr=learning_rate)
+
+    @torch.no_grad()
+    def _evaluate_calibrator(self, data_loader):
+        self.model.eval()
+        total_loss = 0.0
+        total_correct = 0
+        total_users = 0
+        total_gamma_error = 0.0
+
+        for users, labels in data_loader:
+            users = users.to(self.device)
+            labels = labels.to(self.device)
+            logits = self.model.get_calibrator_logits(users)
+            loss = torch.nn.functional.cross_entropy(
+                logits,
+                labels,
+                reduction='sum'
+            )
+            probabilities = torch.softmax(logits, dim=-1)
+            predicted_gamma = torch.sum(
+                probabilities * self.model.gamma_grid,
+                dim=-1
+            )
+            target_gamma = self.model.gamma_grid[labels]
+
+            total_loss += float(loss.cpu())
+            total_correct += int(
+                (logits.argmax(dim=-1) == labels).sum().cpu()
+            )
+            total_gamma_error += float(
+                torch.abs(predicted_gamma - target_gamma).sum().cpu()
+            )
+            total_users += int(users.numel())
+
+        if total_users == 0:
+            raise RuntimeError('Calibration validation loader is empty.')
+        return {
+            'ce': total_loss / total_users,
+            'accuracy': total_correct / total_users,
+            'gamma_mae': total_gamma_error / total_users,
+        }
+
+    def fit(
+        self,
+        train_data,
+        valid_data=None,
+        test_data=None,
+        saved=False,
+        verbose=True
+    ):
+        if valid_data is None or test_data is None:
+            raise ValueError(
+                'CounterfactualCalibrationTrainer requires validation and '
+                'test dataloaders.'
+            )
+
+        artifact = self.model.prepare_counterfactual_calibration(
+            train_data,
+            valid_data
+        )
+        training_dataset = TensorDataset(
+            artifact['train_user_ids'].long(),
+            artifact['train_labels'].long()
+        )
+        validation_dataset = TensorDataset(
+            artifact['validation_user_ids'].long(),
+            artifact['validation_labels'].long()
+        )
+
+        generator = torch.Generator()
+        generator.manual_seed(int(self.config['seed']))
+        training_loader = DataLoader(
+            training_dataset,
+            batch_size=self.calibrator_batch_size,
+            shuffle=True,
+            generator=generator
+        )
+        validation_loader = DataLoader(
+            validation_dataset,
+            batch_size=self.calibrator_batch_size,
+            shuffle=False
+        )
+
+        best_validation_ce = float('inf')
+        best_epoch = None
+        best_calibrator_state = None
+        epochs_without_improvement = 0
+
+        for epoch_idx in range(self.calibrator_epochs):
+            self.model.train()
+            total_training_loss = 0.0
+            total_training_users = 0
+            start_time = time()
+
+            for users, labels in training_loader:
+                users = users.to(self.device)
+                labels = labels.to(self.device)
+                self.optimizer.zero_grad()
+                logits = self.model.get_calibrator_logits(users)
+                loss = torch.nn.functional.cross_entropy(logits, labels)
+                self._check_nan(loss)
+                loss.backward()
+                if self.clip_grad_norm:
+                    clip_grad_norm_(
+                        self.model.calibrator.parameters(),
+                        **self.clip_grad_norm
+                    )
+                self.optimizer.step()
+                self.model.invalidate_inference_cache()
+
+                batch_size = int(users.numel())
+                total_training_loss += float(loss.detach().cpu()) * batch_size
+                total_training_users += batch_size
+
+            validation_statistics = self._evaluate_calibrator(
+                validation_loader
+            )
+            training_ce = total_training_loss / max(total_training_users, 1)
+            elapsed = time() - start_time
+
+            if verbose:
+                self.logger.info(
+                    'calibrator epoch {} [time: {:.2f}s, train_ce: {:.6f}, '
+                    'valid_ce: {:.6f}, valid_accuracy: {:.6f}, '
+                    'valid_gamma_mae: {:.6f}]'.format(
+                        epoch_idx + 1,
+                        elapsed,
+                        training_ce,
+                        validation_statistics['ce'],
+                        validation_statistics['accuracy'],
+                        validation_statistics['gamma_mae']
+                    )
+                )
+
+            if validation_statistics['ce'] < best_validation_ce - 1e-12:
+                best_validation_ce = validation_statistics['ce']
+                best_epoch = epoch_idx + 1
+                epochs_without_improvement = 0
+                best_calibrator_state = {
+                    name: value.detach().cpu().clone()
+                    for name, value in self.model.calibrator.state_dict().items()
+                }
+            else:
+                epochs_without_improvement += 1
+
+            if epochs_without_improvement >= self.calibrator_patience:
+                if verbose:
+                    self.logger.info(
+                        'Calibrator early stopping at epoch {}; best epoch '
+                        'was {} with CE {:.6f}.'.format(
+                            epoch_idx + 1,
+                            best_epoch,
+                            best_validation_ce
+                        )
+                    )
+                break
+
+        if best_calibrator_state is None:
+            raise RuntimeError('Calibrator training did not produce a checkpoint.')
+
+        self.model.calibrator.load_state_dict(best_calibrator_state)
+        self.model.calibration_metadata.update({
+            'best_calibration_epoch': int(best_epoch),
+            'best_calibration_ce': float(best_validation_ce),
+        })
+        self.model.invalidate_inference_cache()
+
+        valid_score, valid_result = self._valid_epoch(valid_data)
+        _, test_result = self._valid_epoch(
+            test_data,
+            is_test=True,
+            idx=best_epoch
+        )
+
+        self.best_valid_score = valid_score
+        self.best_valid_result = valid_result
+        self.best_test_upon_valid = test_result
+
+        if saved:
+            self._save_checkpoint()
+
+        if verbose:
+            self.logger.info(
+                'Best calibrator validation CE: {:.6f} at epoch {}'.format(
+                    best_validation_ce,
+                    best_epoch
+                )
+            )
+            self.logger.info('validation result: \n' + dict2str(valid_result))
+            self.logger.info('test result: \n' + dict2str(test_result))
+            self.logger.info(
+                'calibration statistics: {}'.format(
+                    self.model.get_calibration_statistics()
+                )
+            )
+
+        return valid_score, valid_result, test_result
 
