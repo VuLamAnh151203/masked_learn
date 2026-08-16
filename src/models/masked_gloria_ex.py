@@ -450,7 +450,7 @@ class MASKED_GLORIA_EX(GeneralRecommender):
         # edge_user_ids[e] tells us which user owns original edge e.
         # Shape: [num_interactions]
         #
-        # User-level scalar mask:
+        # User-level scalar mask: 
         #     M_(u,i) = sigmoid(user_mask_logits[u])
         self.register_buffer(
             'edge_user_ids',

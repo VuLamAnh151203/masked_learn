@@ -158,13 +158,17 @@ class Trainer(AbstractTrainer):
         return checkpoint_path
 
     def _save_checkpoint(self):
-        """Atomically save only the model parameters needed for reuse."""
+        """Atomically save model parameters and optional model metadata."""
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         parameter_state = {
             name: parameter.detach()
             for name, parameter in self.model.named_parameters()
         }
         checkpoint = {'state_dict': parameter_state}
+
+        metadata_hook = getattr(self.model, 'get_checkpoint_metadata', None)
+        if callable(metadata_hook):
+            checkpoint['metadata'] = metadata_hook()
 
         temporary_file = self.saved_model_file + '.tmp'
         torch.save(checkpoint, temporary_file)
@@ -174,6 +178,17 @@ class Trainer(AbstractTrainer):
                 self.saved_model_file
             )
         )
+
+    def _is_model_selection_epoch(self, epoch_idx):
+        """Allow models with staged training to delay early stopping."""
+        selection_hook = getattr(
+            self.model,
+            'is_model_selection_epoch',
+            None
+        )
+        if callable(selection_hook):
+            return bool(selection_hook(epoch_idx))
+        return True
 
     def _train_epoch(self, train_data, epoch_idx, loss_func=None):
         r"""Train the model in an epoch
@@ -257,6 +272,11 @@ class Trainer(AbstractTrainer):
         for epoch_idx in range(self.start_epoch, self.epochs):
             # train
             training_start_time = time()
+
+            epoch_hook = getattr(self.model, 'set_training_epoch', None)
+            if callable(epoch_hook):
+                epoch_hook(epoch_idx)
+
             self.model.pre_epoch_processing()
             train_loss, _ = self._train_epoch(train_data, epoch_idx)
             #for param_group in self.optimizer.param_groups:
@@ -277,9 +297,6 @@ class Trainer(AbstractTrainer):
             if (epoch_idx + 1) % self.eval_step == 0:
                 valid_start_time = time()
                 valid_score, valid_result = self._valid_epoch(valid_data)
-                self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
-                    valid_score, self.best_valid_score, self.cur_step,
-                    max_step=self.stopping_step, bigger=self.valid_metric_bigger)
                 valid_end_time = time()
                 valid_score_output = "epoch %d evaluating [time: %.2fs, valid_score: %f]" % \
                                      (epoch_idx, valid_end_time - valid_start_time, valid_score)
@@ -290,6 +307,18 @@ class Trainer(AbstractTrainer):
                     self.logger.info(valid_score_output)
                     self.logger.info(valid_result_output)
                     self.logger.info('test result: \n' + dict2str(test_result))
+
+                if not self._is_model_selection_epoch(epoch_idx):
+                    if verbose:
+                        self.logger.info(
+                            'Model selection deferred until the staged '
+                            'training schedule is complete.'
+                        )
+                    continue
+
+                self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
+                    valid_score, self.best_valid_score, self.cur_step,
+                    max_step=self.stopping_step, bigger=self.valid_metric_bigger)
                 if update_flag:
                     update_output = '██ ' + self.config['model'] + '--Best validation results updated!!!'
                     if verbose:

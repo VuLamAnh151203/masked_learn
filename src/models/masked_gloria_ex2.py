@@ -1,0 +1,573 @@
+
+import os
+import numpy as np
+import scipy.sparse as sp
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.utils import remove_self_loops, add_self_loops, degree
+import torch_geometric
+
+from common.abstract_recommender import GeneralRecommender
+from common.loss import BPRLoss, EmbLoss
+from common.init import xavier_uniform_initialization
+from torch.nn import MultiheadAttention
+# from .transformer import TransformerEncoder
+
+
+def _cfg(config, key, default):
+    """Read an optional config value without requiring ``dict.get``."""
+    try:
+        value = config[key]
+    except Exception:
+        return default
+    return default if value is None else value
+
+
+class MASKED_GLORIA_EX2(GeneralRecommender):
+    def __init__(self, config, dataset):
+        super(MASKED_GLORIA_EX2, self).__init__(config, dataset)
+
+        num_user = self.n_users
+        num_item = self.n_items
+        print('number of users: {}, number of items: {}'.format(num_user, num_item))
+
+        batch_size = config['train_batch_size']         # not used
+        dim_x = config['embedding_size']
+        self.feat_embed_dim = config['feat_embed_dim']
+        self.n_layers = config['n_mm_layers']
+        self.knn_k = config['knn_k']
+
+        self.batch_size = batch_size
+        self.num_user = num_user
+        self.num_item = num_item
+        self.k = 40
+        self.aggr_mode = config['aggr_mode']
+        self.user_aggr_mode = 'softmax'
+        self.num_layer = 1
+        self.dataset = dataset
+        self.reg_weight = config['reg_weight']
+        self.drop_rate = 0.1
+        self.t_rep = None
+        self.t_preference = None
+        self.dim_latent = 64
+        self.mm_adj = None
+        self.config = config
+
+        # Annealed User-Adaptive Neighborhood Modulation schedule.
+        # Epoch numbers stored on the model are one-based for logging and
+        # match the notation used in the experiment description.
+        self.mask_discovery_epochs = int(
+            _cfg(config, 'mask_discovery_epochs', 60)
+        )
+        self.mask_anneal_epochs = int(
+            _cfg(config, 'mask_anneal_epochs', 40)
+        )
+        max_epochs = int(_cfg(config, 'epochs', 1000))
+
+        if self.mask_discovery_epochs <= 0:
+            raise ValueError('mask_discovery_epochs must be a positive integer.')
+        if self.mask_anneal_epochs <= 0:
+            raise ValueError('mask_anneal_epochs must be a positive integer.')
+        if max_epochs <= self.mask_discovery_epochs + self.mask_anneal_epochs:
+            raise ValueError(
+                'epochs must be greater than mask_discovery_epochs + '
+                'mask_anneal_epochs so identity fine-tuning can run.'
+            )
+
+        self.current_epoch = 0
+        self.mask_alpha = 1.0
+        self.mask_stage = 'discovery'
+        self._inference_cache_valid = False
+
+        dataset_path = os.path.abspath(config['data_path'] + config['dataset'])
+
+        mm_adj_file = os.path.join(dataset_path, 'mm_adj_{}.pt'.format(self.knn_k))
+
+        # self.id_embedding_low = nn.Embedding(num_item, self.feat_embed_dim)
+        # self.id_embedding_high = nn.Embedding(num_item, self.feat_embed_dim)
+        self.id_embedding_full = nn.Embedding(num_item, self.feat_embed_dim)
+        self.id_embedding_masked = nn.Embedding(num_item, self.feat_embed_dim)
+
+        self.mlp_item = nn.Linear(self.t_feat.shape[-1], self.dim_latent, bias=False)
+        self.mlp_user = nn.Linear(self.user_feat.shape[-1], self.dim_latent, bias=False)
+
+        indices, text_adj = self.get_knn_adj_mat(self.t_feat)
+        self.mm_adj = text_adj
+
+        train_interactions = dataset.inter_matrix(form='coo').astype(np.float32)
+
+        # ============================================================
+        # Original user-item edges (one direction only)
+        # ============================================================
+        edge_index = self.pack_edge_index(train_interactions)
+        self.num_interactions = edge_index.shape[0]
+
+        # edge_user_ids[e] tells us which user owns original edge e.
+        # Shape: [num_interactions]
+        #
+        # User-level scalar mask:
+        #     M_(u,i) = sigmoid(user_mask_logits[u])
+        self.register_buffer(
+            'edge_user_ids',
+            torch.tensor(
+                edge_index[:, 0],
+                dtype=torch.long,
+                device=self.device
+            )
+        )
+
+        edge_index = torch.tensor(
+            edge_index,
+            dtype=torch.long,
+            device=self.device
+        ).t().contiguous()
+
+        # Keep the same undirected interaction graph as the original code.
+        self.edge_index = torch.cat(
+            [edge_index, edge_index[[1, 0]]],
+            dim=1
+        )
+
+        # ============================================================
+        # USER-LEVEL LEARNABLE SCALAR MASK
+        # ============================================================
+        # Original:
+        #     one learnable logit per interaction edge -> O(|E|)
+        #
+        # Here:
+        #     one learnable logit per user -> O(|U|)
+        #
+        # All interaction edges of user u receive the same scalar:
+        #     m_u = sigmoid(user_mask_logits[u])
+        #
+        # Initialize at zero so sigmoid(0)=0.5, matching the original
+        # edge-level mask initialization for a clean ablation.
+        self.user_mask_logits = nn.Parameter(
+            torch.zeros(
+                self.num_user,
+                device=self.device
+            )
+        )
+
+        edge_index = self.pack_edge_index(train_interactions)
+
+        item_ids = edge_index[:, 1] - self.num_user
+        item_degree = np.bincount(item_ids, minlength=self.num_item)
+
+        high_ratio = 0.10
+        num_high = int(self.num_item * high_ratio)
+
+        high_items = np.argsort(item_degree)[-num_high:]
+        high_items = set(high_items.tolist())
+
+        low_edges = []
+        high_edges = []
+
+        for edge in edge_index:
+            item_id = edge[1] - self.num_user
+
+            if item_id in high_items:
+                high_edges.append(edge)
+            else:
+                low_edges.append(edge)
+
+        low_edges = np.array(low_edges, dtype=np.int64)
+        high_edges = np.array(high_edges, dtype=np.int64)
+
+        self.edge_index_low = torch.tensor(low_edges, dtype=torch.long).t().contiguous().to(self.device)
+        self.edge_index_high = torch.tensor(high_edges, dtype=torch.long).t().contiguous().to(self.device)
+
+        self.edge_index_low = torch.cat(
+            (self.edge_index_low, self.edge_index_low[[1, 0]]),
+            dim=1
+        )
+
+        self.edge_index_high = torch.cat(
+            (self.edge_index_high, self.edge_index_high[[1, 0]]),
+            dim=1
+        )
+        # self.edge = concat 2 edge_index to make the graph undirected
+        # self.edge_index = torch.cat((self.edge_index_low, self.edge_index_high), dim=1)
+
+        # self.idl_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+        #                 num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
+        #                 device=self.device, features=self.id_embedding.weight)
+        # self.idh_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
+        #                 num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
+        #                 device=self.device, features=self.id_embedding.weight)
+
+        self.full_gcn = GCN(
+                        self.dataset,
+                        batch_size,
+                        num_user,
+                        num_item,
+                        dim_x,
+                        self.aggr_mode,
+                        num_layer=self.num_layer,
+                        has_feature=False,
+                        dropout=self.drop_rate,
+                        dim_latent=64,
+                        device=self.device,
+                        features=self.id_embedding_full.weight
+                    )
+
+        self.mask_gcn = GCN(
+            self.dataset,
+            batch_size,
+            num_user,
+            num_item,
+            dim_x,
+            self.aggr_mode,
+            num_layer=self.num_layer,
+            has_feature=False,
+            dropout=self.drop_rate,
+            dim_latent=64,
+            device=self.device,
+            features=self.id_embedding_masked.weight
+        )
+        if config['fusion'] in ['add', 'pool']:
+            pass
+        elif config['fusion'] == 'Multi-Head Attention':
+            self.multihead_attn = nn.MultiheadAttention(embed_dim=64, num_heads=4)
+        elif config['fusion'] == 'Transformer':
+            self.transformer = TransformerEncoder(64, num_heads= 4, layers=2)
+        else:
+            raise NotImplementedError
+
+
+
+    def get_knn_adj_mat(self, mm_embeddings):
+        context_norm = mm_embeddings.div(torch.norm(mm_embeddings, p=2, dim=-1, keepdim=True))
+        sim = torch.mm(context_norm, context_norm.transpose(1, 0))
+        _, knn_ind = torch.topk(sim, self.knn_k, dim=-1)
+        adj_size = sim.size()
+        del sim
+        # construct sparse adj
+        indices0 = torch.arange(knn_ind.shape[0]).to(self.device)
+        indices0 = torch.unsqueeze(indices0, 1)
+        indices0 = indices0.expand(-1, self.knn_k)
+        indices = torch.stack((torch.flatten(indices0), torch.flatten(knn_ind)), 0)
+        # norm
+        return indices, self.compute_normalized_laplacian(indices, adj_size)
+
+    def compute_normalized_laplacian(self, indices, adj_size):
+        adj = torch.sparse.FloatTensor(indices, torch.ones_like(indices[0]), adj_size)
+        row_sum = 1e-7 + torch.sparse.sum(adj, -1).to_dense()
+        r_inv_sqrt = torch.pow(row_sum, -0.5)
+        rows_inv_sqrt = r_inv_sqrt[indices[0]]
+        cols_inv_sqrt = r_inv_sqrt[indices[1]]
+        values = rows_inv_sqrt * cols_inv_sqrt
+        return torch.sparse.FloatTensor(indices, values, adj_size)
+
+    def pack_edge_index(self, inter_mat):
+        rows = inter_mat.row
+        cols = inter_mat.col + self.n_users
+        return np.column_stack((rows, cols))
+
+    def item_item(self, rep):
+        h = rep
+        for i in range(self.n_layers):
+            h = torch.sparse.mm(self.mm_adj, h)
+        return rep + h
+
+    def get_user_mask(self):
+        """Return the learned base mask ``sigmoid(user_mask_logits)``."""
+        return torch.sigmoid(self.user_mask_logits)
+
+    def get_effective_user_mask(self, alpha=None):
+        """
+        Interpolate the learned mask toward the identity graph.
+
+        ``alpha=1`` returns the learned mask and ``alpha=0`` returns exact
+        ones. Keeping the endpoints explicit avoids numerical drift in the
+        identity phase and makes the intended graph unambiguous.
+        """
+        if alpha is None:
+            alpha = self.mask_alpha
+        alpha = float(alpha)
+        if not 0.0 <= alpha <= 1.0:
+            raise ValueError('mask alpha must be in [0, 1].')
+
+        base_mask = self.get_user_mask()
+        if alpha == 0.0:
+            return torch.ones_like(base_mask)
+        if alpha == 1.0:
+            return base_mask
+        return 1.0 - alpha * (1.0 - base_mask)
+
+    def get_inference_user_mask(self):
+        """Validation and test always use the exact identity graph."""
+        return torch.ones_like(self.get_user_mask())
+
+    def get_original_edge_mask(self, user_mask=None):
+        """
+        Expand user-level scalar masks to the original user-item edges.
+
+        For original edge e=(u,i):
+            edge_mask[e] = user_mask[u]
+        """
+        if user_mask is None:
+            user_mask = self.get_user_mask()
+        return user_mask[self.edge_user_ids]
+
+    def _schedule_at_epoch(self, epoch):
+        """Return ``(stage, alpha)`` for a one-based epoch number."""
+        epoch = int(epoch)
+        if epoch <= 0:
+            raise ValueError('epoch must be a positive integer.')
+
+        if epoch <= self.mask_discovery_epochs:
+            return 'discovery', 1.0
+
+        anneal_end = self.mask_discovery_epochs + self.mask_anneal_epochs
+        if epoch <= anneal_end:
+            anneal_step = epoch - self.mask_discovery_epochs
+            alpha = 1.0 - anneal_step / float(self.mask_anneal_epochs)
+            return 'annealing', max(0.0, alpha)
+
+        return 'identity_finetune', 0.0
+
+    def set_training_epoch(self, epoch_idx):
+        """Set the annealing state before training a zero-based epoch."""
+        epoch_idx = int(epoch_idx)
+        if epoch_idx < 0:
+            raise ValueError('epoch_idx must be non-negative.')
+
+        self.current_epoch = epoch_idx + 1
+        self.mask_stage, self.mask_alpha = self._schedule_at_epoch(
+            self.current_epoch
+        )
+
+        # Freeze before the first annealing forward pass. Clearing the old
+        # gradient is essential for optimizers with momentum: a zero gradient
+        # tensor can still trigger an Adam update, while ``grad=None`` makes
+        # the optimizer skip this parameter completely.
+        if self.current_epoch > self.mask_discovery_epochs:
+            self.user_mask_logits.requires_grad_(False)
+            self.user_mask_logits.grad = None
+
+        self._inference_cache_valid = False
+
+    def is_model_selection_epoch(self, epoch_idx):
+        """Only select/checkpoint models after annealing has completed."""
+        epoch = int(epoch_idx) + 1
+        return epoch > (
+            self.mask_discovery_epochs + self.mask_anneal_epochs
+        )
+
+    def get_checkpoint_metadata(self):
+        """Return serializable schedule state for experiment provenance."""
+        return {
+            'current_epoch': int(self.current_epoch),
+            'mask_stage': self.mask_stage,
+            'mask_alpha': float(self.mask_alpha),
+            'mask_discovery_epochs': int(self.mask_discovery_epochs),
+            'mask_anneal_epochs': int(self.mask_anneal_epochs),
+            'mask_frozen': not self.user_mask_logits.requires_grad,
+            'inference_mask_alpha': 0.0,
+        }
+
+    @torch.no_grad()
+    def get_user_mask_statistics(self):
+        """Diagnostics for the learned user-level mask."""
+        user_mask = self.get_user_mask().detach()
+        return {
+            'mean_keep': user_mask.mean().item(),
+            'mean_attenuation': (1.0 - user_mask).mean().item(),
+            'min_keep': user_mask.min().item(),
+            'max_keep': user_mask.max().item(),
+            'std_keep': user_mask.std(unbiased=False).item(),
+        }
+
+    @torch.no_grad()
+    def get_annealing_statistics(self):
+        """Diagnostics for both the learned and currently effective masks."""
+        base_mask = self.get_user_mask().detach()
+        effective_mask = self.get_effective_user_mask().detach()
+        return {
+            'epoch': int(self.current_epoch),
+            'stage': self.mask_stage,
+            'alpha': float(self.mask_alpha),
+            'mask_frozen': not self.user_mask_logits.requires_grad,
+            'base_mean': base_mask.mean().item(),
+            'base_min': base_mask.min().item(),
+            'base_max': base_mask.max().item(),
+            'effective_mean': effective_mask.mean().item(),
+            'effective_min': effective_mask.min().item(),
+            'effective_max': effective_mask.max().item(),
+        }
+
+    def post_epoch_processing(self):
+        stats = self.get_annealing_statistics()
+        return (
+            'annealed user mask: epoch={epoch}, stage={stage}, alpha={alpha:.6f}, '
+            'frozen={mask_frozen}, base_mean={base_mean:.6f}, '
+            'base_range=[{base_min:.6f}, {base_max:.6f}], '
+            'effective_mean={effective_mean:.6f}, '
+            'effective_range=[{effective_min:.6f}, {effective_max:.6f}]'
+        ).format(**stats)
+
+    def compute_result_embedding(self, user_mask):
+        """Compute and fuse the full-graph and modulated-graph branches."""
+        self.full_rep, self.full_preference = self.full_gcn(
+            self.edge_index,
+            self.id_embedding_full.weight
+        )
+
+        mask = self.get_original_edge_mask(user_mask)
+        edge_mask = torch.cat([mask, mask], dim=0)
+
+        self.mask_rep, self.mask_preference = self.mask_gcn(
+            self.edge_index,
+            self.id_embedding_masked.weight,
+            edge_mask=edge_mask
+        )
+
+        item_full = self.full_rep[self.num_user:]
+        item_masked = self.mask_rep[self.num_user:]
+        item_rep = torch.cat((item_full, item_masked), dim=1)
+        item_rep = self.item_item(item_rep)
+
+        user_full = self.full_rep[:self.num_user]
+        user_masked = self.mask_rep[:self.num_user]
+        user_rep = torch.cat((user_full, user_masked), dim=1)
+
+        self.result_embed = torch.cat((user_rep, item_rep), dim=0)
+        return self.result_embed
+
+    def forward(self, interaction):
+        # Parameters change after this forward's optimizer step, so an
+        # identity-graph evaluation cache from an earlier evaluation is stale.
+        if self.training:
+            self._inference_cache_valid = False
+
+        user_nodes = interaction[0]
+        pos_item_nodes = interaction[1] + self.n_users
+        neg_item_nodes = interaction[2] + self.n_users
+
+        effective_user_mask = self.get_effective_user_mask()
+        self.compute_result_embedding(effective_user_mask)
+
+        user_tensor = self.result_embed[user_nodes]
+        pos_item_tensor = self.result_embed[pos_item_nodes]
+        neg_item_tensor = self.result_embed[neg_item_nodes]
+        pos_scores = torch.sum(user_tensor * pos_item_tensor, dim=1)
+        neg_scores = torch.sum(user_tensor * neg_item_tensor, dim=1)
+        return pos_scores, neg_scores
+
+    def calculate_loss(self, interaction):
+        pos_scores, neg_scores = self.forward(interaction)
+        loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
+        return loss_value
+
+    @torch.no_grad()
+    def recompute_inference_result_embedding(self):
+        """Refresh cached representations using the exact identity graph."""
+        inference_user_mask = self.get_inference_user_mask()
+        self.compute_result_embedding(inference_user_mask)
+        self._inference_cache_valid = True
+        return self.result_embed
+
+    def full_sort_predict(self, interaction):
+        if not self._inference_cache_valid:
+            self.recompute_inference_result_embedding()
+
+        user_tensor = self.result_embed[:self.n_users]
+        item_tensor = self.result_embed[self.n_users:]
+
+        temp_user_tensor = user_tensor[interaction[0], :]
+        score_matrix = torch.matmul(temp_user_tensor, item_tensor.t())
+        return score_matrix
+
+class GCN(torch.nn.Module):
+    def __init__(self,datasets, batch_size, num_user, num_item, dim_id, aggr_mode, num_layer, has_feature, dropout,
+                 dim_latent=None,device = None,features=None, user_profile=None):
+        super(GCN, self).__init__()
+        self.batch_size = batch_size
+        self.num_user = num_user
+        self.num_item = num_item
+        self.datasets = datasets
+        self.dim_id = dim_id
+        self.dim_feat = features.size(1)
+        self.dim_latent = dim_latent
+        self.aggr_mode = aggr_mode
+        self.has_feature = has_feature
+        self.dropout = dropout
+        self.device = device
+        self.userprofile = user_profile
+
+        if self.has_feature:
+            self.preference = nn.Parameter(nn.init.xavier_normal_(torch.tensor(
+                np.random.randn(num_user, self.dim_latent), dtype=torch.float32, requires_grad=True),
+                gain=1))
+            self.conv_embed_1 = Base_gcn(self.dim_latent, self.dim_latent, aggr=self.aggr_mode)
+        else:
+            self.preference = nn.Parameter(nn.init.xavier_normal_(torch.tensor(
+                np.random.randn(num_user, self.dim_feat), dtype=torch.float32, requires_grad=True),
+                gain=1))
+            self.conv_embed_1 = Base_gcn(self.dim_latent, self.dim_latent, aggr=self.aggr_mode)
+
+    def forward(self,edge_index,features, edge_mask = None):
+        temp_features = features
+        temp_profile = self.preference
+        x = torch.cat((temp_profile, temp_features), dim=0)
+        x = F.normalize(x)
+        h = self.conv_embed_1(x, edge_index,edge_mask)  # equation 1
+        h_1 = self.conv_embed_1(h, edge_index,edge_mask)  # equation 1
+        h_2 = self.conv_embed_1(h_1, edge_index,edge_mask)
+
+        x_hat =h + x + h_1 + h_2
+        return x_hat, self.preference
+
+
+class Base_gcn(MessagePassing):
+    def __init__(self, in_channels, out_channels, normalize=True, bias=True, aggr='add', **kwargs):
+        super(Base_gcn, self).__init__(aggr=aggr, **kwargs)
+        self.aggr = aggr
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+    def forward(self, x, edge_index,edge_mask=None, size=None):
+        # pdb.set_trace()
+
+        if edge_mask is None:
+            edge_mask = torch.ones(
+                edge_index.size(1),
+                device=x.device,
+                dtype=x.dtype
+            )
+
+        if size is None:
+            edge_index, _ = remove_self_loops(edge_index)
+            # edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
+        x = x.unsqueeze(-1) if x.dim() == 1 else x
+        # pdb.set_trace()
+        return self.propagate(edge_index, size=(x.size(0), x.size(0)), x=x, edge_mask = edge_mask)
+
+    def message(self, x_j, edge_index, size,edge_mask):
+        if self.aggr == 'add':
+            # pdb.set_trace()
+            row, col = edge_index
+            deg = degree(row, size[0], dtype=x_j.dtype)
+            deg_inv_sqrt = deg.pow(-0.5)
+            deg_inv_sqrt[
+            torch.isinf(deg_inv_sqrt)
+            ] = 0
+
+            norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+            # return norm.view(-1, 1) * x_j
+            return (
+                norm.view(-1, 1)
+                * edge_mask.view(-1, 1)
+                * x_j
+            )
+        return x_j
+
+    def update(self, aggr_out):
+        return aggr_out
+
+    def __repr(self):
+        return '{}({},{})'.format(self.__class__.__name__, self.in_channels, self.out_channels)
+
