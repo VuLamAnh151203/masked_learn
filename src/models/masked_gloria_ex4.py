@@ -14,9 +14,9 @@ from common.init import xavier_uniform_initialization
 from torch.nn import MultiheadAttention
 # from .transformer import TransformerEncoder
 
-class MASKED_GLORIA_EX4(GeneralRecommender):
+class MASKED_GLORIA_EX(GeneralRecommender):
     def __init__(self, config, dataset):
-        super(MASKED_GLORIA_EX4, self).__init__(config, dataset)
+        super(MASKED_GLORIA_EX, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
@@ -93,18 +93,19 @@ class MASKED_GLORIA_EX4(GeneralRecommender):
         )
 
         # ============================================================
-        # V1: USER-SPECIFIC STRUCTURAL MASKING RATE
+        # USER-LEVEL LEARNABLE SCALAR MASK
         # ============================================================
-        # Learn a user-specific DROP probability budget:
+        # Original:
+        #     one learnable logit per interaction edge -> O(|E|)
         #
-        #     p_u = p_max * sigmoid(user_mask_logits[u])
+        # Here:
+        #     one learnable logit per user -> O(|U|)
         #
-        # During training, each interaction edge e=(u,i) samples a
-        # Binary-Concrete keep/drop variable using keep_prob = 1-p_u.
-        # Exact dropped edges are resampled every forward pass.
+        # All interaction edges of user u receive the same scalar:
+        #     m_u = sigmoid(user_mask_logits[u])
         #
-        # At validation/test time branch 2 uses the full graph.
-        # Setting user_drop_pmax=0 exactly gives Full + Full.
+        # Initialize at zero so sigmoid(0)=0.5, matching the original
+        # edge-level mask initialization for a clean ablation.
         self.user_mask_logits = nn.Parameter(
             torch.zeros(
                 self.num_user,
@@ -112,19 +113,7 @@ class MASKED_GLORIA_EX4(GeneralRecommender):
             )
         )
 
-        self.user_drop_pmax = float(0.10)
-        self.structural_mask_temperature = float(0.5)
-        
-        self.structural_mask_hard = bool(True)
-        self.structural_mask_eps = 1e-7
-
-        self.last_user_drop_prob = None
-        self.last_soft_edge_keep_mask = None
-        self.last_edge_keep_mask = None
-
-        # Avoid using the stochastic embedding from the last training
-        # forward during ranking evaluation.
-        self._deterministic_eval_cache_valid = False
+        self.beta = 0.1
 
         edge_index = self.pack_edge_index(train_interactions)
 
@@ -247,156 +236,38 @@ class MASKED_GLORIA_EX4(GeneralRecommender):
             h = torch.sparse.mm(self.mm_adj, h)
         return rep + h
 
-    def get_user_drop_probability(self):
+    def get_user_mask(self):
+        """Return one learned scalar mask value for each user."""
+        user_mask = (
+                    1.0
+                    + self.beta
+                    * torch.tanh(self.user_mask_logits)
+                )
+        return user_mask
+
+    def get_original_edge_mask(self):
         """
-        User-specific structural perturbation budget:
+        Expand user-level scalar masks to the original user-item edges.
 
-            p_u = p_max * sigmoid(theta_u)
-
-        Shape: [num_user], range [0, p_max].
+        For original edge e=(u,i):
+            edge_mask[e] = sigmoid(user_mask_logits[u])
         """
-        if self.user_drop_pmax <= 0.0:
-            return torch.zeros(
-                self.num_user,
-                device=self.user_mask_logits.device,
-                dtype=self.user_mask_logits.dtype
-            )
-
-        return (
-            self.user_drop_pmax
-            * torch.sigmoid(self.user_mask_logits)
-        )
-
-    def sample_structural_edge_mask(self):
-        """
-        Sample a differentiable keep/drop mask for ORIGINAL user-item
-        interactions.
-
-        For edge e=(u,i):
-            p_drop(e) = p_u
-            p_keep(e) = 1 - p_u
-
-        Binary Concrete:
-            z_soft = sigmoid((logit(p_keep) + logistic_noise) / tau)
-
-        With structural_mask_hard=True, forward values are exactly 0/1
-        while gradients use the soft Binary-Concrete relaxation.
-        """
-        user_drop_prob = self.get_user_drop_probability()
-        edge_drop_prob = user_drop_prob[self.edge_user_ids]
-        edge_keep_prob = 1.0 - edge_drop_prob
-
-        # No structural intervention at validation/test.
-        if (not self.training) or self.user_drop_pmax <= 0.0:
-            edge_keep_mask = torch.ones_like(edge_keep_prob)
-
-            self.last_user_drop_prob = user_drop_prob.detach()
-            self.last_soft_edge_keep_mask = edge_keep_mask.detach()
-            self.last_edge_keep_mask = edge_keep_mask.detach()
-            return edge_keep_mask
-
-        eps = self.structural_mask_eps
-        keep_prob = edge_keep_prob.clamp(
-            min=eps,
-            max=1.0 - eps
-        )
-
-        keep_logits = (
-            torch.log(keep_prob)
-            - torch.log1p(-keep_prob)
-        )
-
-        uniform = torch.rand_like(keep_prob).clamp(
-            min=eps,
-            max=1.0 - eps
-        )
-        logistic_noise = (
-            torch.log(uniform)
-            - torch.log1p(-uniform)
-        )
-
-        tau = max(
-            float(self.structural_mask_temperature),
-            1e-4
-        )
-
-        soft_mask = torch.sigmoid(
-            (keep_logits + logistic_noise) / tau
-        )
-
-        if self.structural_mask_hard:
-            hard_mask = (soft_mask >= 0.5).to(soft_mask.dtype)
-
-            # Straight-through estimator:
-            # forward = hard_mask, backward = gradient(soft_mask)
-            edge_keep_mask = (
-                hard_mask
-                - soft_mask.detach()
-                + soft_mask
-            )
-        else:
-            edge_keep_mask = soft_mask
-
-        self.last_user_drop_prob = user_drop_prob.detach()
-        self.last_soft_edge_keep_mask = soft_mask.detach()
-        self.last_edge_keep_mask = edge_keep_mask.detach()
-
-        return edge_keep_mask
-
-    def make_undirected_structural_mask(self):
-        """
-        Sample once per original interaction and use the same keep/drop
-        value for the reverse direction.
-        """
-        original_mask = self.sample_structural_edge_mask()
-
-        return torch.cat(
-            [original_mask, original_mask],
-            dim=0
-        )
+        user_mask = self.get_user_mask()
+        return user_mask[self.edge_user_ids]
 
     @torch.no_grad()
     def get_user_mask_statistics(self):
-        """
-        Diagnostics for user-specific DROP probabilities.
-
-        Here the learned user quantity is p_u (drop budget), not a
-        deterministic message weight.
-        """
-        user_drop_prob = self.get_user_drop_probability().detach()
-        expected_keep = 1.0 - user_drop_prob
-
-        stats = {
-            'p_max': float(self.user_drop_pmax),
-            'mean_drop_probability': user_drop_prob.mean().item(),
-            'std_drop_probability': user_drop_prob.std(
-                unbiased=False
-            ).item(),
-            'min_drop_probability': user_drop_prob.min().item(),
-            'max_drop_probability': user_drop_prob.max().item(),
-            'mean_keep_probability': expected_keep.mean().item(),
-            'min_keep_probability': expected_keep.min().item(),
-            'max_keep_probability': expected_keep.max().item(),
+        """Diagnostics for the learned user-level mask."""
+        user_mask = self.get_user_mask().detach()
+        return {
+            'mean_keep': user_mask.mean().item(),
+            'mean_attenuation': (1.0 - user_mask).mean().item(),
+            'min_keep': user_mask.min().item(),
+            'max_keep': user_mask.max().item(),
+            'std_keep': user_mask.std(unbiased=False).item(),
         }
 
-        if self.last_edge_keep_mask is not None:
-            sampled = self.last_edge_keep_mask
-            stats['last_sample_mean_keep'] = sampled.mean().item()
-            stats['last_sample_drop_fraction'] = (
-                1.0 - sampled.mean().item()
-            )
-
-        if self.last_soft_edge_keep_mask is not None:
-            stats['last_soft_mean_keep'] = (
-                self.last_soft_edge_keep_mask.mean().item()
-            )
-
-        return stats
-
     def forward(self, interaction):
-        if self.training:
-            self._deterministic_eval_cache_valid = False
-
         user_nodes = interaction[0]
         pos_item_nodes = interaction[1] + self.n_users
         neg_item_nodes = interaction[2] + self.n_users
@@ -413,12 +284,22 @@ class MASKED_GLORIA_EX4(GeneralRecommender):
                                             )
 
         # ============================================================
-        # V1: USER-ADAPTIVE STRUCTURAL VIEW
+        # User-level scalar mask
         # ============================================================
-        # p_u controls HOW MUCH structural perturbation user u receives.
-        # Exact dropped edges are resampled each training forward.
-        # At evaluation this returns an all-ones edge mask.
-        edge_mask = self.make_undirected_structural_mask()
+        # user_mask: [num_user]
+        # mask:      [num_interactions]
+        #
+        # Every interaction edge of the same user receives the same
+        # learned scalar weight.
+        user_mask = self.get_user_mask()
+        mask = user_mask[self.edge_user_ids]
+
+        # self.edge_index = original edges + reverse edges.
+        # Use the same user-conditioned mask in both directions.
+        edge_mask = torch.cat(
+            [mask, mask],
+            dim=0
+        )
 
         self.mask_rep, self.mask_preference = self.mask_gcn(
                                                 self.edge_index,
@@ -447,85 +328,15 @@ class MASKED_GLORIA_EX4(GeneralRecommender):
 
     def calculate_loss(self, interaction):
         pos_scores, neg_scores = self.forward(interaction)
-
-        # Original BPR objective; no auxiliary loss in V1.
-        loss_value = -torch.mean(
-            torch.log2(
-                torch.sigmoid(pos_scores - neg_scores)
-            )
-        )
-
-        self._deterministic_eval_cache_valid = False
+        loss_value = -torch.mean(torch.log2(torch.sigmoid(pos_scores - neg_scores)))
         return loss_value
 
-    @torch.no_grad()
-    def recompute_deterministic_result_embedding(self):
-        """
-        Validation/test:
-            Full branch  -> full graph
-            Branch 2     -> full graph
-
-        Branch-2 parameters are nevertheless those learned while seeing
-        user-adaptive structural perturbations during training.
-        """
-        full_rep, full_preference = self.full_gcn(
-            self.edge_index,
-            self.id_embedding_full.weight
-        )
-
-        edge_mask = torch.ones(
-            self.edge_index.size(1),
-            device=self.edge_index.device,
-            dtype=self.id_embedding_masked.weight.dtype
-        )
-
-        mask_rep, mask_preference = self.mask_gcn(
-            self.edge_index,
-            self.id_embedding_masked.weight,
-            edge_mask=edge_mask
-        )
-
-        item_repl = full_rep[self.num_user:]
-        item_reph = mask_rep[self.num_user:]
-
-        item_rep = torch.cat(
-            (item_repl, item_reph),
-            dim=1
-        )
-        item_rep = self.item_item(item_rep)
-
-        user_repl = full_rep[:self.num_user]
-        user_reph = mask_rep[:self.num_user]
-
-        user_rep = torch.cat(
-            (user_repl, user_reph),
-            dim=1
-        )
-
-        self.full_rep = full_rep
-        self.full_preference = full_preference
-        self.mask_rep = mask_rep
-        self.mask_preference = mask_preference
-        self.result_embed = torch.cat(
-            (user_rep, item_rep),
-            dim=0
-        )
-
-        self._deterministic_eval_cache_valid = True
-        return self.result_embed
-
     def full_sort_predict(self, interaction):
-        if not self._deterministic_eval_cache_valid:
-            self.recompute_deterministic_result_embedding()
-
         user_tensor = self.result_embed[:self.n_users]
         item_tensor = self.result_embed[self.n_users:]
 
         temp_user_tensor = user_tensor[interaction[0], :]
-        score_matrix = torch.matmul(
-            temp_user_tensor,
-            item_tensor.t()
-        )
+        score_matrix = torch.matmul(temp_user_tensor, item_tensor.t())
         return score_matrix
 
 class GCN(torch.nn.Module):
