@@ -21,6 +21,8 @@ python src/counterfactual_edge_analysis.py --number_of_user 100 --user_selection
 ```
 
 `--number_of_user` is optional; omitting it selects every eligible test user.
+Users whose baseline Recall@20 is exactly zero are excluded before either
+random sampling or descending-Recall selection.
 Every incident train edge of each selected user is set to zero separately in
 the masked branch, and the script recomputes both target-user metrics and exact
 full-test metrics. Results are written incrementally under

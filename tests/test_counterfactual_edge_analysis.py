@@ -177,6 +177,29 @@ class UserAndEdgeSelectionTest(unittest.TestCase):
                 strategy='recall_desc'
             )
 
+    def test_zero_recall_users_are_excluded_before_selection(self):
+        scores = {0: 0.0, 1: 0.5, 2: 0.0, 3: 1.0}
+        selected = select_target_users(
+            [0, 1, 2, 3],
+            [0, 1, 2, 3],
+            None,
+            seed=999,
+            strategy='recall_desc',
+            user_scores=scores,
+            exclude_zero_scores=True
+        )
+        self.assertTrue(np.array_equal(selected, [3, 1]))
+        with self.assertRaises(ValueError):
+            select_target_users(
+                [0, 1, 2, 3],
+                [0, 1, 2, 3],
+                3,
+                seed=999,
+                strategy='random',
+                user_scores=scores,
+                exclude_zero_scores=True
+            )
+
     def test_every_incident_edge_is_grouped_once(self):
         mapping = build_user_edge_map([0, 0, 1, 2, 2], [0, 2])
         self.assertEqual(mapping, {0: [0, 1], 2: [3, 4]})

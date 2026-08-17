@@ -66,7 +66,7 @@ def parse_args(argv=None):
         dest='number_of_user',
         type=int,
         default=None,
-        help='number of test users to sample; omitted means all eligible users'
+        help='number of eligible test users to analyze; omitted means all'
     )
     parser.add_argument(
         '--selection_seed',
@@ -74,7 +74,7 @@ def parse_args(argv=None):
         dest='selection_seed',
         type=int,
         default=999,
-        help='seed for reproducible user sampling'
+        help='seed for reproducible random user sampling'
     )
     parser.add_argument(
         '--user_selection',
@@ -229,7 +229,8 @@ def select_target_users(
     number_of_user,
     seed,
     strategy='random',
-    user_scores=None
+    user_scores=None,
+    exclude_zero_scores=False
 ):
     """Select eligible test users randomly or by descending baseline score."""
     eval_users = np.asarray(eval_users, dtype=np.int64)
@@ -241,6 +242,30 @@ def select_target_users(
     )
     if eligible.size == 0:
         raise ValueError('No test user has an incident train edge.')
+
+    if exclude_zero_scores:
+        if user_scores is None:
+            raise ValueError(
+                'user_scores are required when excluding zero-score users.'
+            )
+        try:
+            eligible_scores = np.asarray(
+                [user_scores[int(user_id)] for user_id in eligible],
+                dtype=np.float64
+            )
+        except KeyError as error:
+            raise ValueError(
+                'Missing baseline score for eligible user {}.'.format(
+                    error.args[0]
+                )
+            )
+        if not np.isfinite(eligible_scores).all():
+            raise ValueError('Baseline user scores must all be finite.')
+        eligible = eligible[eligible_scores > 0.0]
+        if eligible.size == 0:
+            raise ValueError(
+                'No eligible test user has baseline Recall@20 greater than 0.'
+            )
 
     if number_of_user is not None and number_of_user > eligible.size:
         raise ValueError(
@@ -407,6 +432,19 @@ def prepare_run_directory(output_root, run_name, metadata, resume):
                 'Cannot resume: metadata does not match checkpoint, dataset, '
                 'selected users, metrics, or evaluation settings.'
             )
+        metadata_updated = False
+        for key in (
+            'user_selection',
+            'selection_metric',
+            'selection_order',
+            'zero_recall_users_excluded',
+            'positive_recall_eligible_users',
+        ):
+            if key not in previous and key in metadata:
+                previous[key] = metadata[key]
+                metadata_updated = True
+        if metadata_updated:
+            atomic_write_json(metadata_path, previous)
         metadata = previous
     else:
         atomic_write_json(metadata_path, metadata)
@@ -770,6 +808,13 @@ def build_summary(results_path, metadata, baseline_overall):
         'user_selection': metadata.get('user_selection', 'random'),
         'selection_metric': metadata.get('selection_metric'),
         'selection_order': metadata.get('selection_order'),
+        'zero_recall_users_excluded': metadata.get(
+            'zero_recall_users_excluded',
+            False
+        ),
+        'positive_recall_eligible_users': metadata.get(
+            'positive_recall_eligible_users'
+        ),
         'selection_seed': metadata['selection_seed'],
         'number_of_user': metadata['number_of_user'],
         'selected_user_count': len(metadata['selected_users']),
@@ -923,7 +968,8 @@ def run_analysis(args):
         args.number_of_user,
         args.selection_seed,
         strategy=args.user_selection,
-        user_scores=baseline_recall_at_20
+        user_scores=baseline_recall_at_20,
+        exclude_zero_scores=True
     )
     user_edges = build_user_edge_map(edge_users, selected_users)
     total_interventions = sum(
@@ -963,6 +1009,14 @@ def run_analysis(args):
             if args.user_selection == 'recall_desc'
             else 'seeded_random_without_replacement'
         ),
+        'zero_recall_users_excluded': True,
+        'positive_recall_eligible_users': int(sum(
+            baseline_recall_at_20[int(user_id)] > 0.0
+            for user_id in np.intersect1d(
+                np.unique(eval_users),
+                np.unique(edge_users)
+            )
+        )),
         'selection_seed': int(args.selection_seed),
         'number_of_user': args.number_of_user,
         'eligible_test_users': int(
@@ -1022,6 +1076,10 @@ def run_analysis(args):
 
     print('Selected test users : {}'.format(len(selected_users)))
     print('User selection      : {}'.format(args.user_selection))
+    print('Recall@20 = 0 users : {} excluded'.format(
+        metadata['eligible_test_users']
+        - metadata['positive_recall_eligible_users']
+    ))
     if args.user_selection == 'recall_desc' and len(selected_users):
         first_user = int(selected_users[0])
         last_user = int(selected_users[-1])
