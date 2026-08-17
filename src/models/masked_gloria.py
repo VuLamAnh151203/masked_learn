@@ -69,9 +69,16 @@ class MASKED_GLORIA(GeneralRecommender):
 
         self.num_interactions = edge_index.shape[0]
 
-        edge_index = torch.tensor(edge_index, 
+        edge_index = torch.tensor(edge_index,
                                   dtype=torch.long,
-                                  device = self.device).t().contiguous()
+                                  device=self.device).t().contiguous()
+
+        # Keep the forward interaction ordering used by mask_logits.  These are
+        # runtime tensors (not persistent buffers), so adding them does not
+        # change the model state_dict or invalidate existing checkpoints.
+        self.forward_edge_index = edge_index
+        self.forward_edge_users = edge_index[0]
+        self.forward_edge_items = edge_index[1] - self.num_user
 
         self.edge_index = torch.cat(
                             [edge_index, edge_index[[1, 0]]],
@@ -206,47 +213,145 @@ class MASKED_GLORIA(GeneralRecommender):
             h = torch.sparse.mm(self.mm_adj, h)
         return rep + h
 
+    def get_forward_edge_mask(self):
+        """Return the learned weight for every forward user-item edge."""
+        return torch.sigmoid(self.mask_logits)
+
+    def get_user_edge_ids(self, user_id):
+        """Return mask-logit indices for train edges incident to ``user_id``."""
+        user_id = int(user_id)
+        if user_id < 0 or user_id >= self.num_user:
+            raise ValueError(
+                'user_id must be in [0, {}), got {}.'.format(
+                    self.num_user,
+                    user_id
+                )
+            )
+        return torch.nonzero(
+            self.forward_edge_users == user_id,
+            as_tuple=False
+        ).flatten()
+
+    def get_counterfactual_forward_mask(self, edge_id, base_mask=None):
+        """Clone a forward mask and set exactly one learned edge weight to 0."""
+        edge_id = int(edge_id)
+        if edge_id < 0 or edge_id >= self.num_interactions:
+            raise ValueError(
+                'edge_id must be in [0, {}), got {}.'.format(
+                    self.num_interactions,
+                    edge_id
+                )
+            )
+
+        if base_mask is None:
+            base_mask = self.get_forward_edge_mask()
+        self._validate_forward_edge_mask(base_mask)
+
+        counterfactual_mask = base_mask.clone()
+        counterfactual_mask[edge_id] = 0.0
+        return counterfactual_mask
+
+    def _validate_forward_edge_mask(self, forward_edge_mask):
+        if not torch.is_tensor(forward_edge_mask):
+            raise TypeError('forward_edge_mask must be a torch.Tensor.')
+        if forward_edge_mask.dim() != 1:
+            raise ValueError(
+                'forward_edge_mask must be one-dimensional, got shape {}.'
+                .format(tuple(forward_edge_mask.shape))
+            )
+        if forward_edge_mask.numel() != self.num_interactions:
+            raise ValueError(
+                'forward_edge_mask has {} values, expected {}.'
+                .format(
+                    forward_edge_mask.numel(),
+                    self.num_interactions
+                )
+            )
+
+    def compute_full_view(self):
+        """
+        Compute the invariant full-GCN view used by counterfactual inference.
+
+        The returned tuple contains raw full-branch user and item
+        representations.  It can safely be reused while only the masked branch
+        is intervened on; the joint item-item operator is still applied after
+        concatenating both branches to preserve the original computation.
+        """
+        self.full_rep, self.full_preference = self.full_gcn(
+            self.edge_index,
+            self.id_embedding_full.weight
+        )
+        full_user_rep = self.full_rep[:self.num_user]
+        full_item_rep = self.full_rep[self.num_user:]
+        return full_user_rep, full_item_rep
+
+    def compute_result_embedding(self, forward_edge_mask=None, full_view=None):
+        """
+        Build recommendation embeddings with an optional masked-branch override.
+
+        ``forward_edge_mask`` has one value per original user-item interaction.
+        Each value is duplicated internally for the reverse item-user edge.
+        Supplying ``full_view`` avoids recomputing the invariant full branch.
+        """
+        if forward_edge_mask is None:
+            forward_edge_mask = self.get_forward_edge_mask()
+        self._validate_forward_edge_mask(forward_edge_mask)
+
+        forward_edge_mask = forward_edge_mask.to(
+            device=self.edge_index.device,
+            dtype=self.id_embedding_masked.weight.dtype
+        )
+        edge_mask = torch.cat(
+            [forward_edge_mask, forward_edge_mask],
+            dim=0
+        )
+
+        if full_view is None:
+            full_user_rep, full_item_rep = self.compute_full_view()
+        else:
+            if not isinstance(full_view, (tuple, list)) or len(full_view) != 2:
+                raise TypeError(
+                    'full_view must be a (user_rep, item_rep) pair.'
+                )
+            full_user_rep, full_item_rep = full_view
+            if full_user_rep.shape[0] != self.num_user:
+                raise ValueError('full_view contains an invalid user count.')
+            if full_item_rep.shape[0] != self.num_item:
+                raise ValueError('full_view contains an invalid item count.')
+
+        self.mask_rep, self.mask_preference = self.mask_gcn(
+            self.edge_index,
+            self.id_embedding_masked.weight,
+            edge_mask=edge_mask
+        )
+
+        masked_user_rep = self.mask_rep[:self.num_user]
+        masked_item_rep = self.mask_rep[self.num_user:]
+
+        user_rep = torch.cat(
+            [full_user_rep, masked_user_rep],
+            dim=1
+        )
+        item_rep = torch.cat(
+            [full_item_rep, masked_item_rep],
+            dim=1
+        )
+        item_rep = self.item_item(item_rep)
+        self.result_embed = torch.cat([user_rep, item_rep], dim=0)
+        return self.result_embed
+
     def forward(self, interaction):
         user_nodes, pos_item_nodes, neg_item_nodes = interaction[0], interaction[1], interaction[2]
-        pos_item_nodes += self.n_users
-        neg_item_nodes += self.n_users
+        pos_item_nodes = pos_item_nodes + self.n_users
+        neg_item_nodes = neg_item_nodes + self.n_users
 
         # item_feat = self.mlp_item(self.t_feat)
         # user_feat = F.normalize(self.mlp_user(self.user_feat))
-        
+
         # self.idl_rep, self.t_preference = self.idl_gcn(self.edge_index, self.id_embedding_low.weight)
         # self.idh_rep, self.id_preference = self.idh_gcn(self.edge_index, self.id_embedding_high.weight)
 
-        self.full_rep, self.full_preference = self.full_gcn(
-                                                self.edge_index,
-                                                self.id_embedding_full.weight
-                                            )
-
-        mask = torch.sigmoid(self.mask_logits)
-
-        edge_mask = torch.cat(
-                        [mask, mask],
-                        dim=0
-                    )
-
-        self.mask_rep, self.mask_preference = self.mask_gcn(
-                                                self.edge_index,
-                                                self.id_embedding_masked.weight,
-                                                edge_mask=edge_mask
-                                            )
-
-        item_repl = self.full_rep[self.num_user:]
-        item_reph = self.mask_rep[self.num_user:]
-
-        item_rep = torch.cat((item_repl, item_reph), dim=1)
-        item_rep = self.item_item(item_rep)
-
-        user_repl = self.full_rep[:self.num_user]
-        user_reph = self.mask_rep[:self.num_user]
-
-        user_rep = torch.cat((user_repl, user_reph), dim=1)
-
-        self.result_embed = torch.cat((user_rep, item_rep), dim=0)
+        self.compute_result_embedding()
         user_tensor = self.result_embed[user_nodes]
         pos_item_tensor = self.result_embed[pos_item_nodes]
         neg_item_tensor = self.result_embed[neg_item_nodes]
@@ -260,6 +365,8 @@ class MASKED_GLORIA(GeneralRecommender):
         return loss_value
 
     def full_sort_predict(self, interaction):
+        if not hasattr(self, 'result_embed') or self.result_embed is None:
+            self.compute_result_embedding()
         user_tensor = self.result_embed[:self.n_users]
         item_tensor = self.result_embed[self.n_users:]
 
