@@ -15,7 +15,7 @@ from torch.nn import MultiheadAttention
 # from .transformer import TransformerEncoder
 
 
-class MASKED_GLORIA_EX(GeneralRecommender):
+class MASKED_GLORIA_EX4(GeneralRecommender):
     """
     Counterfactual user-routing V1.
 
@@ -50,7 +50,7 @@ class MASKED_GLORIA_EX(GeneralRecommender):
     """
 
     def __init__(self, config, dataset):
-        super(MASKED_GLORIA_EX, self).__init__(config, dataset)
+        super(MASKED_GLORIA_EX4, self).__init__(config, dataset)
 
         num_user = self.n_users
         num_item = self.n_items
