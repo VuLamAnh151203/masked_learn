@@ -26,97 +26,110 @@ def _cfg_bool(config, key, default):
 
 
 class MASKED_GLORIA_CF3(MASKED_GLORIA):
-    """MASKED_GLORIA with broad + fine-grained mask regularization.
+    """MASKED_GLORIA with broad mask regularization + hard-negative ranking.
 
-    Broad regularizer:
+    Broad mask regularizer:
         history item -> similarity to the user's history prototype -> mask order.
 
-    Fine-grained regularizer:
-        history item -> similarity to a target positive item from the current
-        training mini-batch -> mask order.
+    Hard-negative ranking regularizer:
+        for a sampled user/positive pair, sample unseen candidate items, select
+        the highest-scoring candidates under the current final representation,
+        and explicitly push the positive above those local hard competitors.
 
-    Both similarity signals are detached, so these auxiliary losses directly
-    supervise the learnable edge masks. They do not directly optimize item
-    representations.
+    No graph edge is dropped by either auxiliary objective.
     """
 
     def __init__(self, config, dataset):
         super(MASKED_GLORIA_CF3, self).__init__(config, dataset)
 
-        # Existing broad/history-prototype loss.
-        self.cf2_lambda = float(_cfg(config, 'cf2_lambda', 0.1))
-        self.cf2_temperature = float(
-            _cfg(config, 'cf2_temperature', 1.0)
+        self.cf3_lambda = float(_cfg(config, 'cf3_lambda', 0.1))
+        self.cf3_temperature = float(
+            _cfg(config, 'cf3_temperature', 1.0)
         )
-
-        # New fine-grained/target-specific loss.
-        # Keep this smaller than the broad loss at first so that the new
-        # objective does not overwrite the behavior that already improves
-        # Recall@15/20.
-        self.cf2_fine_lambda = float(_cfg(config, 'cf2_fine_lambda', 0.02))
-        self.cf2_fine_temperature = float(
-            _cfg(config, 'cf2_fine_temperature', 1.0)
-        )
-        self.cf2_fine_pair_count = int(
-            _cfg(config, 'cf2_fine_pair_count', 16)
-        )
-        self.cf2_warmup_ratio = float(
-            _cfg(config, 'cf2_warmup_ratio', 0.10)
+        self.cf3_warmup_ratio = float(
+            _cfg(config, 'cf3_warmup_ratio', 0.10)
         )
         configured_warmup_epochs = int(
-            _cfg(config, 'cf2_warmup_epochs', 50)
+            _cfg(config, 'cf3_warmup_epochs', 50)
         )
-        self.cf2_user_ratio = float(_cfg(config, 'cf2_user_ratio', 0.10))
-        self.cf2_batch_size = int(_cfg(config, 'cf2_batch_size', 8))
-        self.cf2_pair_count = int(_cfg(config, 'cf2_pair_count', 32))
-        self.cf2_min_history = int(_cfg(config, 'cf2_min_history', 2))
-        self.cf2_similarity_eps = float(
-            _cfg(config, 'cf2_similarity_eps', 1e-6)
+        self.cf3_user_ratio = float(_cfg(config, 'cf3_user_ratio', 0.10))
+        self.cf3_batch_size = int(_cfg(config, 'cf3_batch_size', 8))
+        self.cf3_pair_count = int(_cfg(config, 'cf3_pair_count', 32))
+        self.cf3_min_history = int(_cfg(config, 'cf3_min_history', 2))
+        self.cf3_similarity_eps = float(
+            _cfg(config, 'cf3_similarity_eps', 1e-6)
         )
-        self.cf2_seed_offset = int(
-            _cfg(config, 'cf2_seed_offset', 20000)
+        self.cf3_seed_offset = int(
+            _cfg(config, 'cf3_seed_offset', 20000)
         )
-        self.cf2_log_stats = _cfg_bool(config, 'cf2_log_stats', True)
+        self.cf3_log_stats = _cfg_bool(config, 'cf3_log_stats', True)
+
+        # Hard-negative local-ranking loss.
+        # Start small because the broad mask loss already improves Recall@15/20.
+        self.hard_lambda = float(_cfg(config, 'hard_lambda', 0.01))
+        self.hard_temperature = float(
+            _cfg(config, 'hard_temperature', 1.0)
+        )
+        self.hard_margin = float(_cfg(config, 'hard_margin', 0.0))
+        self.hard_candidate_pool = int(
+            _cfg(config, 'hard_candidate_pool', 256)
+        )
+        self.hard_topk = int(_cfg(config, 'hard_topk', 10))
+        self.hard_user_ratio = float(
+            _cfg(config, 'hard_user_ratio', self.cf3_user_ratio)
+        )
+        self.hard_batch_size = int(
+            _cfg(config, 'hard_batch_size', self.cf3_batch_size)
+        )
 
         max_epochs = int(_cfg(config, 'epochs', 1000))
         if configured_warmup_epochs >= 0:
-            self.cf2_warmup_epochs = configured_warmup_epochs
+            self.cf3_warmup_epochs = configured_warmup_epochs
         else:
-            self.cf2_warmup_epochs = int(
-                math.ceil(max_epochs * self.cf2_warmup_ratio)
+            self.cf3_warmup_epochs = int(
+                math.ceil(max_epochs * self.cf3_warmup_ratio)
             )
 
-        self._validate_cf2_config()
+        self._validate_cf3_config()
         self.current_epoch = 0
-        self._cf2_rng = random.Random(self.cf2_seed_offset)
-        self.user_to_edge_ids = self._build_cf2_history()
-        self.cf2_stats = self._new_cf2_stats()
+        self._cf3_rng = random.Random(self.cf3_seed_offset)
+        self.user_to_edge_ids = self._build_cf3_history()
+        self.cf3_stats = self._new_cf3_stats()
 
-    def _validate_cf2_config(self):
-        if self.cf2_lambda < 0.0:
-            raise ValueError('cf2_lambda must be non-negative.')
-        if self.cf2_temperature <= 0.0:
-            raise ValueError('cf2_temperature must be positive.')
-        if self.cf2_fine_lambda < 0.0:
-            raise ValueError('cf2_fine_lambda must be non-negative.')
-        if self.cf2_fine_temperature <= 0.0:
-            raise ValueError('cf2_fine_temperature must be positive.')
-        if self.cf2_fine_pair_count <= 0:
-            raise ValueError('cf2_fine_pair_count must be positive.')
-        if not 0.0 <= self.cf2_user_ratio <= 1.0:
-            raise ValueError('cf2_user_ratio must be in [0, 1].')
-        if self.cf2_batch_size <= 0:
-            raise ValueError('cf2_batch_size must be positive.')
-        if self.cf2_pair_count <= 0:
-            raise ValueError('cf2_pair_count must be positive.')
-        if self.cf2_min_history < 2:
-            raise ValueError('cf2_min_history must be at least 2.')
-        if self.cf2_similarity_eps < 0.0:
-            raise ValueError('cf2_similarity_eps must be non-negative.')
-        if self.cf2_warmup_epochs < 0:
-            raise ValueError('cf2_warmup_epochs must be non-negative.')
+    def _validate_cf3_config(self):
+        if self.cf3_lambda < 0.0:
+            raise ValueError('cf3_lambda must be non-negative.')
+        if self.cf3_temperature <= 0.0:
+            raise ValueError('cf3_temperature must be positive.')
+        if not 0.0 <= self.cf3_user_ratio <= 1.0:
+            raise ValueError('cf3_user_ratio must be in [0, 1].')
+        if self.cf3_batch_size <= 0:
+            raise ValueError('cf3_batch_size must be positive.')
+        if self.cf3_pair_count <= 0:
+            raise ValueError('cf3_pair_count must be positive.')
+        if self.cf3_min_history < 2:
+            raise ValueError('cf3_min_history must be at least 2.')
+        if self.cf3_similarity_eps < 0.0:
+            raise ValueError('cf3_similarity_eps must be non-negative.')
+        if self.cf3_warmup_epochs < 0:
+            raise ValueError('cf3_warmup_epochs must be non-negative.')
 
-    def _build_cf2_history(self):
+        if self.hard_lambda < 0.0:
+            raise ValueError('hard_lambda must be non-negative.')
+        if self.hard_temperature <= 0.0:
+            raise ValueError('hard_temperature must be positive.')
+        if self.hard_margin < 0.0:
+            raise ValueError('hard_margin must be non-negative.')
+        if self.hard_candidate_pool <= 0:
+            raise ValueError('hard_candidate_pool must be positive.')
+        if self.hard_topk <= 0:
+            raise ValueError('hard_topk must be positive.')
+        if not 0.0 <= self.hard_user_ratio <= 1.0:
+            raise ValueError('hard_user_ratio must be in [0, 1].')
+        if self.hard_batch_size <= 0:
+            raise ValueError('hard_batch_size must be positive.')
+
+    def _build_cf3_history(self):
         user_to_edge_ids = [[] for _ in range(self.num_user)]
         edge_users = self.forward_edge_users.detach().cpu().tolist()
         for edge_id, user_id in enumerate(edge_users):
@@ -124,9 +137,9 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
         return tuple(tuple(edge_ids) for edge_ids in user_to_edge_ids)
 
     @staticmethod
-    def _new_cf2_stats():
+    def _new_cf3_stats():
         return {
-            # Broad/history-prototype stats.
+            # Broad/history-prototype mask regularization.
             'samples': 0,
             'eligible': 0,
             'pairs': 0,
@@ -134,13 +147,14 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
             'loss_sum': 0.0,
             'similarity_gap_sum': 0.0,
 
-            # Fine-grained/target-specific stats.
-            'fine_samples': 0,
-            'fine_eligible': 0,
-            'fine_pairs': 0,
-            'fine_used': 0,
-            'fine_loss_sum': 0.0,
-            'fine_similarity_gap_sum': 0.0,
+            # Hard-negative local ranking.
+            'hard_samples': 0,
+            'hard_eligible': 0,
+            'hard_used': 0,
+            'hard_loss_sum': 0.0,
+            'hard_pos_score_sum': 0.0,
+            'hard_neg_score_sum': 0.0,
+            'hard_gap_sum': 0.0,
         }
 
     def set_training_epoch(self, epoch_idx):
@@ -148,57 +162,77 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
         if epoch_idx < 0:
             raise ValueError('epoch_idx must be non-negative.')
         self.current_epoch = epoch_idx
-        self._cf2_rng.seed(self.cf2_seed_offset + epoch_idx)
+        self._cf3_rng.seed(self.cf3_seed_offset + epoch_idx)
 
     def pre_epoch_processing(self):
-        self.cf2_stats = self._new_cf2_stats()
+        self.cf3_stats = self._new_cf3_stats()
 
     def post_epoch_processing(self):
-        if not self.cf2_log_stats:
+        if not self.cf3_log_stats:
             return None
 
-        used = max(self.cf2_stats['used'], 1)
-        fine_used = max(self.cf2_stats['fine_used'], 1)
+        used = max(self.cf3_stats['used'], 1)
+        hard_used = max(self.cf3_stats['hard_used'], 1)
+
         return (
-            'mask-representation regularization: epoch={epoch}, '
-            'warmup_epochs={warmup}, '
-            'broad_lambda={lambda_cf2:.6f}, broad_temperature={temperature:.6f}, '
+            'mask-representation + hard-negative regularization: '
+            'epoch={epoch}, warmup_epochs={warmup}, '
+            'broad_lambda={lambda_cf3:.6f}, '
+            'broad_temperature={temperature:.6f}, '
             'broad_samples={samples}, broad_eligible={eligible}, '
             'broad_pairs={pairs}, broad_used={used_count}, '
             'broad_loss={loss:.6f}, broad_similarity_gap={gap:.6f}, '
-            'fine_lambda={fine_lambda:.6f}, fine_temperature={fine_temperature:.6f}, '
-            'fine_samples={fine_samples}, fine_eligible={fine_eligible}, '
-            'fine_pairs={fine_pairs}, fine_used={fine_used_count}, '
-            'fine_loss={fine_loss:.6f}, fine_similarity_gap={fine_gap:.6f}'
+            'hard_lambda={hard_lambda:.6f}, '
+            'hard_temperature={hard_temperature:.6f}, '
+            'hard_margin={hard_margin:.6f}, '
+            'hard_pool={hard_pool}, hard_topk={hard_topk}, '
+            'hard_samples={hard_samples}, hard_eligible={hard_eligible}, '
+            'hard_used={hard_used_count}, hard_loss={hard_loss:.6f}, '
+            'hard_pos_score={hard_pos:.6f}, '
+            'hard_neg_score={hard_neg:.6f}, '
+            'hard_pos_minus_neg={hard_gap:.6f}'
         ).format(
             epoch=int(self.current_epoch),
-            warmup=int(self.cf2_warmup_epochs),
-            lambda_cf2=float(self.cf2_lambda),
-            temperature=float(self.cf2_temperature),
-            samples=int(self.cf2_stats['samples']),
-            eligible=int(self.cf2_stats['eligible']),
-            pairs=int(self.cf2_stats['pairs']),
-            used_count=int(self.cf2_stats['used']),
-            loss=float(self.cf2_stats['loss_sum'] / used),
-            gap=float(self.cf2_stats['similarity_gap_sum'] / used),
-            fine_lambda=float(self.cf2_fine_lambda),
-            fine_temperature=float(self.cf2_fine_temperature),
-            fine_samples=int(self.cf2_stats['fine_samples']),
-            fine_eligible=int(self.cf2_stats['fine_eligible']),
-            fine_pairs=int(self.cf2_stats['fine_pairs']),
-            fine_used_count=int(self.cf2_stats['fine_used']),
-            fine_loss=float(self.cf2_stats['fine_loss_sum'] / fine_used),
-            fine_gap=float(
-                self.cf2_stats['fine_similarity_gap_sum'] / fine_used
+            warmup=int(self.cf3_warmup_epochs),
+
+            lambda_cf3=float(self.cf3_lambda),
+            temperature=float(self.cf3_temperature),
+            samples=int(self.cf3_stats['samples']),
+            eligible=int(self.cf3_stats['eligible']),
+            pairs=int(self.cf3_stats['pairs']),
+            used_count=int(self.cf3_stats['used']),
+            loss=float(self.cf3_stats['loss_sum'] / used),
+            gap=float(self.cf3_stats['similarity_gap_sum'] / used),
+
+            hard_lambda=float(self.hard_lambda),
+            hard_temperature=float(self.hard_temperature),
+            hard_margin=float(self.hard_margin),
+            hard_pool=int(self.hard_candidate_pool),
+            hard_topk=int(self.hard_topk),
+            hard_samples=int(self.cf3_stats['hard_samples']),
+            hard_eligible=int(self.cf3_stats['hard_eligible']),
+            hard_used_count=int(self.cf3_stats['hard_used']),
+            hard_loss=float(self.cf3_stats['hard_loss_sum'] / hard_used),
+            hard_pos=float(
+                self.cf3_stats['hard_pos_score_sum'] / hard_used
+            ),
+            hard_neg=float(
+                self.cf3_stats['hard_neg_score_sum'] / hard_used
+            ),
+            hard_gap=float(
+                self.cf3_stats['hard_gap_sum'] / hard_used
             ),
         )
 
-    def _is_cf2_active(self):
+    def _is_cf3_active(self):
         return (
             self.training
-            and (self.cf2_lambda > 0.0 or self.cf2_fine_lambda > 0.0)
-            and self.cf2_user_ratio > 0.0
-            and self.current_epoch >= self.cf2_warmup_epochs
+            and (self.cf3_lambda > 0.0 or self.hard_lambda > 0.0)
+            and (
+                self.cf3_user_ratio > 0.0
+                or self.hard_user_ratio > 0.0
+            )
+            and self.current_epoch >= self.cf3_warmup_epochs
         )
 
     def _calculate_rec_loss(self, interaction):
@@ -209,12 +243,11 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
 
     def calculate_loss(self, interaction):
         loss_rec = self._calculate_rec_loss(interaction)
-        if not self._is_cf2_active():
+        if not self._is_cf3_active():
             self.result_embed = None
             return loss_rec
 
-        # Keep the broad loss exactly as before.
-        if self.cf2_lambda > 0.0:
+        if self.cf3_lambda > 0.0:
             loss_mask_relation = self._calculate_mask_relation_loss(
                 interaction,
                 loss_rec
@@ -222,27 +255,26 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
         else:
             loss_mask_relation = loss_rec * 0.0
 
-        # Add target-specific fine-grained mask supervision.
-        if self.cf2_fine_lambda > 0.0:
-            loss_fine_relation = self._calculate_fine_mask_relation_loss(
+        if self.hard_lambda > 0.0:
+            loss_hard_negative = self._calculate_hard_negative_loss(
                 interaction,
                 loss_rec
             )
         else:
-            loss_fine_relation = loss_rec * 0.0
+            loss_hard_negative = loss_rec * 0.0
 
-        weighted_relation = (
-            self.cf2_lambda * loss_mask_relation
-            + self.cf2_fine_lambda * loss_fine_relation
+        weighted_auxiliary = (
+            self.cf3_lambda * loss_mask_relation
+            + self.hard_lambda * loss_hard_negative
         )
 
         self.result_embed = None
 
-        # Preserve the old two-term return structure so an existing trainer
-        # that already handles (loss_rec, auxiliary_loss) does not need change.
-        return loss_rec, weighted_relation
+        # Preserve the old trainer API:
+        # trainer can keep summing the returned loss terms.
+        return loss_rec, weighted_auxiliary
 
-    def _sample_cf2_users(self, interaction):
+    def _sample_cf3_users(self, interaction):
         if interaction is None or len(interaction) == 0:
             return []
 
@@ -251,55 +283,29 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
         if not users:
             return []
 
-        sample_count = int(math.ceil(len(users) * self.cf2_user_ratio))
+        sample_count = int(math.ceil(len(users) * self.cf3_user_ratio))
         sample_count = max(1, sample_count)
-        sample_count = min(sample_count, self.cf2_batch_size, len(users))
-        return self._cf2_rng.sample(users, sample_count)
+        sample_count = min(sample_count, self.cf3_batch_size, len(users))
+        return self._cf3_rng.sample(users, sample_count)
 
-    def _sample_cf2_pairs(self, history_size, pair_count=None):
-        if pair_count is None:
-            pair_count = self.cf2_pair_count
-        pair_count = int(pair_count)
-
+    def _sample_cf3_pairs(self, history_size):
         total_pairs = history_size * (history_size - 1) // 2
-        if total_pairs <= pair_count:
+        if total_pairs <= self.cf3_pair_count:
             return list(itertools.combinations(range(history_size), 2))
 
         pairs = set()
-        while len(pairs) < pair_count:
-            left = self._cf2_rng.randrange(history_size)
-            right = self._cf2_rng.randrange(history_size)
+        while len(pairs) < self.cf3_pair_count:
+            left = self._cf3_rng.randrange(history_size)
+            right = self._cf3_rng.randrange(history_size)
             if left == right:
                 continue
             pairs.add(tuple(sorted((left, right))))
         return list(pairs)
 
-    @staticmethod
-    def _build_batch_positive_targets(interaction):
-        """Map each user in the current mini-batch to its positive item(s).
-
-        This assumes the existing training tuple has the same layout already
-        implied by _calculate_rec_loss / forward:
-            interaction[0] -> user ids
-            interaction[1] -> positive item ids
-        """
-        if interaction is None or len(interaction) < 2:
-            return {}
-
-        users = interaction[0].detach().view(-1).cpu().tolist()
-        positives = interaction[1].detach().view(-1).cpu().tolist()
-        if len(users) != len(positives):
-            return {}
-
-        targets = {}
-        for user_id, item_id in zip(users, positives):
-            targets.setdefault(int(user_id), []).append(int(item_id))
-        return targets
-
     def _calculate_mask_relation_loss(self, interaction, reference_loss):
         """Apply pairwise similarity ordering to current mask weights."""
-        sampled_users = self._sample_cf2_users(interaction)
-        self.cf2_stats['samples'] += len(sampled_users)
+        sampled_users = self._sample_cf3_users(interaction)
+        self.cf3_stats['samples'] += len(sampled_users)
         if not sampled_users or self.result_embed is None:
             return reference_loss * 0.0
 
@@ -312,10 +318,10 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
 
         for user_id in sampled_users:
             edge_ids = self.user_to_edge_ids[int(user_id)]
-            if len(edge_ids) < self.cf2_min_history:
+            if len(edge_ids) < self.cf3_min_history:
                 continue
 
-            self.cf2_stats['eligible'] += 1
+            self.cf3_stats['eligible'] += 1
             edge_tensor = torch.tensor(
                 edge_ids,
                 dtype=torch.long,
@@ -329,13 +335,13 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
                 dim=1
             ).detach()
 
-            pair_positions = self._sample_cf2_pairs(len(edge_ids))
+            pair_positions = self._sample_cf3_pairs(len(edge_ids))
 
             for left_pos, right_pos in pair_positions:
                 relevance_gap = (
                     relevance[left_pos] - relevance[right_pos]
                 )
-                if abs(float(relevance_gap.detach().cpu())) <= self.cf2_similarity_eps:
+                if abs(float(relevance_gap.detach().cpu())) <= self.cf3_similarity_eps:
                     continue
 
                 left_edge = int(edge_ids[left_pos])
@@ -343,17 +349,17 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
                 mask_gap = mask_weights[left_edge] - mask_weights[right_edge]
                 direction = torch.sign(relevance_gap)
                 pair_loss = F.softplus(
-                    -self.cf2_temperature * direction * mask_gap
+                    -self.cf3_temperature * direction * mask_gap
                 )
                 losses.append(pair_loss)
 
                 with torch.no_grad():
-                    self.cf2_stats['pairs'] += 1
-                    self.cf2_stats['used'] += 1
-                    self.cf2_stats['loss_sum'] += float(
+                    self.cf3_stats['pairs'] += 1
+                    self.cf3_stats['used'] += 1
+                    self.cf3_stats['loss_sum'] += float(
                         pair_loss.detach().cpu()
                     )
-                    self.cf2_stats['similarity_gap_sum'] += float(
+                    self.cf3_stats['similarity_gap_sum'] += float(
                         relevance_gap.abs().detach().cpu()
                     )
 
@@ -361,120 +367,254 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
             return reference_loss * 0.0
         return torch.stack(losses).mean()
 
-    def _calculate_fine_mask_relation_loss(self, interaction, reference_loss):
-        """Target-specific pairwise ordering loss for edge masks.
+    def _sample_hard_users(self, interaction):
+        """Sample users for the hard-negative auxiliary objective."""
+        if interaction is None or len(interaction) == 0:
+            return []
 
-        For a sampled user u:
-          1) choose one positive item p from the current training mini-batch;
-          2) remove the history edge whose item is p from the candidate set
-             (if present), preventing the trivial cos(p, p)=1 supervision;
-          3) compute detached cosine similarity between each remaining history
-             item representation and the target item representation;
-          4) order edge masks according to these target-specific similarities.
+        users = torch.unique(interaction[0].detach()).cpu().tolist()
+        users = [int(user_id) for user_id in users]
+        if not users:
+            return []
 
-        The cosine signal is detached. Therefore this auxiliary loss directly
-        updates mask parameters, not item representations.
+        sample_count = int(math.ceil(len(users) * self.hard_user_ratio))
+        sample_count = max(1, sample_count)
+        sample_count = min(
+            sample_count,
+            self.hard_batch_size,
+            len(users)
+        )
+        return self._cf3_rng.sample(users, sample_count)
+
+    @staticmethod
+    def _build_batch_positive_targets(interaction):
+        """Map each mini-batch user to the positive item ids in that batch.
+
+        This follows the tuple layout already implied by _calculate_rec_loss:
+            interaction[0] = user ids
+            interaction[1] = positive item ids
         """
-        target_items_by_user = self._build_batch_positive_targets(interaction)
-        if not target_items_by_user:
+        if interaction is None or len(interaction) < 2:
+            return {}
+
+        users = interaction[0].detach().view(-1).cpu().tolist()
+        positives = interaction[1].detach().view(-1).cpu().tolist()
+
+        if len(users) != len(positives):
+            return {}
+
+        mapping = {}
+        for user_id, item_id in zip(users, positives):
+            mapping.setdefault(int(user_id), []).append(int(item_id))
+        return mapping
+
+    def _user_seen_item_set(self, user_id):
+        """Return training items already connected to the user."""
+        edge_ids = self.user_to_edge_ids[int(user_id)]
+        if not edge_ids:
+            return set()
+
+        edge_tensor = torch.tensor(
+            edge_ids,
+            dtype=torch.long,
+            device=self.forward_edge_items.device
+        )
+        return set(
+            int(item_id)
+            for item_id in self.forward_edge_items[edge_tensor]
+            .detach().cpu().tolist()
+        )
+
+    def _sample_unseen_candidates(
+        self,
+        num_items,
+        excluded_items,
+        candidate_count
+    ):
+        """Sample item ids not present in excluded_items.
+
+        Uses Python's range-backed random.sample so it does not materialize the
+        whole item catalog. A modest oversampling loop handles filtered items.
+        """
+        candidate_count = int(min(candidate_count, num_items))
+        if candidate_count <= 0:
+            return []
+
+        excluded_items = {
+            int(item_id)
+            for item_id in excluded_items
+            if 0 <= int(item_id) < num_items
+        }
+
+        available_count = num_items - len(excluded_items)
+        target_count = min(candidate_count, available_count)
+        if target_count <= 0:
+            return []
+
+        selected = set()
+        # Keep drawing modest random blocks until enough unseen items are found.
+        # This is efficient for the normal recommendation regime where each
+        # user's history is much smaller than the full item catalog.
+        max_rounds = 20
+        for _ in range(max_rounds):
+            if len(selected) >= target_count:
+                break
+
+            need = target_count - len(selected)
+            draw_count = min(
+                num_items,
+                max(need * 2, need + 16)
+            )
+            drawn = self._cf3_rng.sample(range(num_items), draw_count)
+
+            for item_id in drawn:
+                if item_id in excluded_items or item_id in selected:
+                    continue
+                selected.add(int(item_id))
+                if len(selected) >= target_count:
+                    break
+
+        # Rare fallback for very dense users / small item catalogs.
+        if len(selected) < target_count:
+            for item_id in range(num_items):
+                if item_id in excluded_items or item_id in selected:
+                    continue
+                selected.add(int(item_id))
+                if len(selected) >= target_count:
+                    break
+
+        return list(selected)
+
+    def _calculate_hard_negative_loss(self, interaction, reference_loss):
+        """Local ranking loss against current high-scoring unseen negatives.
+
+        For each sampled user:
+          1) choose one positive item from the current training mini-batch;
+          2) sample a pool of unseen candidate items;
+          3) score the pool with the CURRENT FINAL representation;
+          4) take the top-scoring candidates as hard negatives;
+          5) push the positive above those hard negatives.
+
+        The top-k selection is performed on detached scores, but the selected
+        positive/negative scores retain gradients. Therefore the auxiliary loss
+        trains the final user/item representation (and any upstream parameters
+        that produced it), rather than supervising mask ordering directly.
+        """
+        if self.result_embed is None:
             return reference_loss * 0.0
 
-        sampled_users = self._sample_cf2_users(interaction)
-        self.cf2_stats['fine_samples'] += len(sampled_users)
-
-        if not sampled_users or self.result_embed is None:
+        if not torch.is_tensor(self.result_embed):
             return reference_loss * 0.0
 
-        if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+        if self.result_embed.dim() != 2:
             return reference_loss * 0.0
 
-        item_rep = self.mask_rep[self.num_user:]
-        mask_weights = self.get_forward_edge_mask()
+        # result_embed is expected to follow the same packed node layout used
+        # throughout this model: [users ; items].
+        if self.result_embed.size(0) <= self.num_user:
+            return reference_loss * 0.0
+
+        user_rep = self.result_embed[:self.num_user]
+        item_rep = self.result_embed[self.num_user:]
+        num_items = int(item_rep.size(0))
+
+        positives_by_user = self._build_batch_positive_targets(interaction)
+        sampled_users = self._sample_hard_users(interaction)
+
+        self.cf3_stats['hard_samples'] += len(sampled_users)
+
+        if not sampled_users or not positives_by_user:
+            return reference_loss * 0.0
+
         losses = []
 
         for user_id in sampled_users:
-            target_candidates = target_items_by_user.get(int(user_id), [])
-            if not target_candidates:
+            positive_candidates = positives_by_user.get(int(user_id), [])
+            if not positive_candidates:
                 continue
 
-            # One target per sampled user keeps V1 cheap and target-specific.
-            target_item = int(self._cf2_rng.choice(target_candidates))
-            if target_item < 0 or target_item >= item_rep.size(0):
+            # One target per sampled user keeps the auxiliary branch cheap.
+            pos_item = int(self._cf3_rng.choice(positive_candidates))
+            if pos_item < 0 or pos_item >= num_items:
                 continue
 
-            edge_ids = self.user_to_edge_ids[int(user_id)]
-            if len(edge_ids) < self.cf2_min_history:
+            seen_items = self._user_seen_item_set(user_id)
+            excluded_items = set(seen_items)
+            excluded_items.add(pos_item)
+
+            candidate_ids = self._sample_unseen_candidates(
+                num_items=num_items,
+                excluded_items=excluded_items,
+                candidate_count=self.hard_candidate_pool
+            )
+            if not candidate_ids:
                 continue
 
-            edge_tensor = torch.tensor(
-                edge_ids,
+            candidate_tensor = torch.tensor(
+                candidate_ids,
                 dtype=torch.long,
-                device=self.forward_edge_users.device
+                device=item_rep.device
             )
-            item_ids = self.forward_edge_items[edge_tensor]
 
-            # Critical: if the positive target itself is one of the user's
-            # graph edges, do not let that edge participate in pair ranking.
-            # Otherwise its target similarity is trivially 1.
-            keep_mask = item_ids != target_item
-            candidate_edge_tensor = edge_tensor[keep_mask]
-            candidate_item_ids = item_ids[keep_mask]
+            u_vec = user_rep[int(user_id)]
+            pos_score = torch.sum(
+                u_vec * item_rep[pos_item],
+                dim=-1
+            )
 
-            if candidate_edge_tensor.numel() < self.cf2_min_history:
+            candidate_scores = torch.matmul(
+                item_rep[candidate_tensor],
+                u_vec
+            )
+
+            hard_k = min(
+                int(self.hard_topk),
+                int(candidate_scores.numel())
+            )
+            if hard_k <= 0:
                 continue
 
-            self.cf2_stats['fine_eligible'] += 1
+            # Selection is discrete; use detached values only to decide which
+            # candidates are hard. Gather the original scores afterwards so
+            # gradients still flow through the selected negatives.
+            hard_positions = torch.topk(
+                candidate_scores.detach(),
+                k=hard_k,
+                largest=True,
+                sorted=False
+            ).indices
+            hard_scores = candidate_scores[hard_positions]
 
-            # Fine-grained target-specific signal:
-            #   edge item <-> current positive target item.
-            # Detach the entire signal so it is supervision for masks only.
-            with torch.no_grad():
-                target_rep = item_rep[target_item]
-                relevance = F.cosine_similarity(
-                    item_rep[candidate_item_ids],
-                    target_rep.unsqueeze(0),
-                    dim=1
-                )
-
-            pair_positions = self._sample_cf2_pairs(
-                int(candidate_edge_tensor.numel()),
-                pair_count=self.cf2_fine_pair_count
+            # Pairwise local ranking:
+            #     s_pos >= s_hard_neg + margin
+            pair_losses = F.softplus(
+                (
+                    hard_scores
+                    - pos_score
+                    + self.hard_margin
+                ) / self.hard_temperature
             )
+            user_loss = pair_losses.mean()
+            losses.append(user_loss)
 
-            for left_pos, right_pos in pair_positions:
-                relevance_gap = (
-                    relevance[left_pos] - relevance[right_pos]
+            with torch.no_grad():
+                mean_hard_score = hard_scores.mean()
+                self.cf3_stats['hard_eligible'] += 1
+                self.cf3_stats['hard_used'] += 1
+                self.cf3_stats['hard_loss_sum'] += float(
+                    user_loss.detach().cpu()
                 )
-
-                if abs(float(relevance_gap.detach().cpu())) <= self.cf2_similarity_eps:
-                    continue
-
-                left_edge = int(candidate_edge_tensor[left_pos].item())
-                right_edge = int(candidate_edge_tensor[right_pos].item())
-
-                mask_gap = (
-                    mask_weights[left_edge]
-                    - mask_weights[right_edge]
+                self.cf3_stats['hard_pos_score_sum'] += float(
+                    pos_score.detach().cpu()
                 )
-                direction = torch.sign(relevance_gap)
-
-                # Keep the same pairwise formulation as the working broad
-                # loss, so this experiment isolates only the new signal.
-                pair_loss = F.softplus(
-                    -self.cf2_fine_temperature * direction * mask_gap
+                self.cf3_stats['hard_neg_score_sum'] += float(
+                    mean_hard_score.detach().cpu()
                 )
-                losses.append(pair_loss)
-
-                with torch.no_grad():
-                    self.cf2_stats['fine_pairs'] += 1
-                    self.cf2_stats['fine_used'] += 1
-                    self.cf2_stats['fine_loss_sum'] += float(
-                        pair_loss.detach().cpu()
-                    )
-                    self.cf2_stats['fine_similarity_gap_sum'] += float(
-                        relevance_gap.abs().detach().cpu()
-                    )
+                self.cf3_stats['hard_gap_sum'] += float(
+                    (pos_score - mean_hard_score).detach().cpu()
+                )
 
         if not losses:
             return reference_loss * 0.0
+
         return torch.stack(losses).mean()
