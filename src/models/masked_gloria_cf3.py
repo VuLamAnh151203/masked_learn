@@ -66,9 +66,9 @@ class MASKED_GLORIA_CF3(MASKED_GLORIA):
         )
         # Defaults use every user in the current interaction batch.  The
         # options remain configurable for large-data training.
-        self.cf3_user_ratio = float(_cfg(config, 'cf3_user_ratio', 1.0))
+        self.cf3_user_ratio = float(_cfg(config, 'cf3_user_ratio', 0.1))
         self.cf3_batch_size = int(_cfg(config, 'cf3_batch_size', 1024))
-        self.cf3_pair_count = int(_cfg(config, 'cf3_pair_count', 32))
+        self.cf3_pair_count = int(_cfg(config, 'cf3_pair_count', 16))
         # One pseudo-positive is removed from the history, hence three edges
         # are needed to leave at least two candidate edges for a pair.
         self.cf3_min_history = int(_cfg(config, 'cf3_min_history', 3))
