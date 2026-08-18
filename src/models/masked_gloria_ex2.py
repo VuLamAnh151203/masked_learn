@@ -570,4 +570,3 @@ class Base_gcn(MessagePassing):
 
     def __repr(self):
         return '{}({},{})'.format(self.__class__.__name__, self.in_channels, self.out_channels)
-
