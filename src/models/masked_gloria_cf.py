@@ -50,7 +50,7 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
             )
         )
         self.cf_warmup_ratio = float(_cfg(config, 'cf_warmup_ratio', 0.10))
-        configured_warmup_epochs = int(_cfg(config, 'cf_warmup_epochs', -1))
+        configured_warmup_epochs = int(_cfg(config, 'cf_warmup_epochs', 0))
         self.cf_user_ratio = float(_cfg(config, 'cf_user_ratio', 0.10))
         self.cf_batch_size = int(_cfg(config, 'cf_batch_size', 8))
         self.cf_k = int(_cfg(config, 'cf_k', 20))
