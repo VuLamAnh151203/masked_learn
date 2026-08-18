@@ -45,6 +45,15 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
         self.cf_boundary_q = int(_cfg(config, 'cf_boundary_q', 3))
         self.cf_temperature = float(_cfg(config, 'cf_temperature', 1.0))
         self.cf_min_history = int(_cfg(config, 'cf_min_history', 2))
+        self.cf_edge_selector = str(
+            _cfg(config, 'cf_edge_selector', 'representation')
+        ).strip().lower()
+        self.cf_selector_top_n = int(
+            _cfg(config, 'cf_selector_top_n', 3)
+        )
+        self.cf_selector_damage_eps = float(
+            _cfg(config, 'cf_selector_damage_eps', 1e-8)
+        )
         self.cf_drop_bidirectional = _cfg_bool(
             config,
             'cf_drop_bidirectional',
@@ -86,6 +95,14 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
             raise ValueError('cf_temperature must be positive.')
         if self.cf_min_history < 2:
             raise ValueError('cf_min_history must be at least 2.')
+        if self.cf_edge_selector not in ('representation', 'gradient', 'random'):
+            raise ValueError(
+                'cf_edge_selector must be representation, gradient, or random.'
+            )
+        if self.cf_selector_top_n <= 0:
+            raise ValueError('cf_selector_top_n must be positive.')
+        if self.cf_selector_damage_eps < 0.0:
+            raise ValueError('cf_selector_damage_eps must be non-negative.')
         if self.cf_warmup_epochs < 0:
             raise ValueError('cf_warmup_epochs must be non-negative.')
         if not self.cf_drop_bidirectional:
@@ -118,8 +135,12 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
             'samples': 0,
             'eligible': 0,
             'fragile': 0,
+            'candidates_verified': 0,
+            'positive_damage': 0,
+            'skipped_no_damage': 0,
             'used': 0,
             'loss_sum': 0.0,
+            'damage_sum': 0.0,
         }
 
     def set_training_epoch(self, epoch_idx):
@@ -140,17 +161,28 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
         mean_loss = self.cf_stats['loss_sum'] / used
         return (
             'boundary CF: epoch={epoch}, warmup_epochs={warmup}, '
-            'lambda={lambda_cf:.6f}, samples={samples}, eligible={eligible}, '
-            'fragile={fragile}, used={used_count}, boundary_loss={loss:.6f}'
+            'lambda={lambda_cf:.6f}, selector={selector}, top_n={top_n}, '
+            'samples={samples}, eligible={eligible}, fragile={fragile}, '
+            'verified={verified}, positive_damage={positive}, '
+            'skipped_no_damage={skipped}, used={used_count}, '
+            'boundary_loss={loss:.6f}, damage={damage:.6f}'
         ).format(
             epoch=int(self.current_epoch),
             warmup=int(self.cf_warmup_epochs),
             lambda_cf=float(self.cf_lambda),
+            selector=str(self.cf_edge_selector),
+            top_n=int(self.cf_selector_top_n),
             samples=int(self.cf_stats['samples']),
             eligible=int(self.cf_stats['eligible']),
             fragile=int(self.cf_stats['fragile']),
+            verified=int(self.cf_stats['candidates_verified']),
+            positive=int(self.cf_stats['positive_damage']),
+            skipped=int(self.cf_stats['skipped_no_damage']),
             used_count=int(self.cf_stats['used']),
             loss=float(mean_loss),
+            damage=float(
+                self.cf_stats['damage_sum'] / used
+            ),
         )
 
     def _is_cf_active(self):
@@ -243,12 +275,16 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
                 if not self._is_fragile_rank(rank_p):
                     continue
 
+                boundary_item_id = self._select_fixed_boundary_item(
+                    probe_scores,
+                    pseudo_item_id
+                )
                 boundary_items = self._select_boundary_items(
                     probe_scores,
                     pseudo_item_id
                 )
 
-            if boundary_items.numel() == 0:
+            if boundary_items.numel() == 0 or boundary_item_id is None:
                 continue
 
             self.cf_stats['fragile'] += 1
@@ -259,7 +295,44 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
             if not other_edges:
                 continue
 
-            second_edge_id = self._cf_rng.choice(other_edges)
+            probe_margin = float(
+                (
+                    probe_scores[pseudo_item_id]
+                    - probe_scores[boundary_item_id]
+                ).detach().cpu()
+            )
+            selector_scores = self._score_cf_candidates(
+                base_mask=base_mask,
+                full_view=full_view,
+                probe_mask=probe_mask,
+                user_id=user_id,
+                pseudo_item_id=pseudo_item_id,
+                boundary_item_id=boundary_item_id,
+                candidate_edges=other_edges
+            )
+            candidate_edges = self._rank_cf_candidates(
+                other_edges,
+                selector_scores
+            )[:self.cf_selector_top_n]
+            if not candidate_edges:
+                continue
+
+            second_edge_id, best_damage = self._verify_cf_candidates(
+                base_mask=base_mask,
+                full_view=full_view,
+                user_id=user_id,
+                pseudo_edge_id=pseudo_edge_id,
+                pseudo_item_id=pseudo_item_id,
+                boundary_item_id=boundary_item_id,
+                candidate_edges=candidate_edges,
+                probe_margin=probe_margin
+            )
+            if second_edge_id is None or best_damage <= self.cf_selector_damage_eps:
+                self.cf_stats['skipped_no_damage'] += 1
+                continue
+
+            self.cf_stats['positive_damage'] += 1
+            self.cf_stats['damage_sum'] += float(best_damage)
             cf_mask = base_mask.clone()
             cf_mask[pseudo_edge_id] = 0.0
             cf_mask[second_edge_id] = 0.0
@@ -284,6 +357,138 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
             return reference_loss * 0.0
 
         return torch.stack(boundary_losses).mean()
+
+    def _score_cf_candidates(
+        self,
+        base_mask,
+        full_view,
+        probe_mask,
+        user_id,
+        pseudo_item_id,
+        boundary_item_id,
+        candidate_edges
+    ):
+        """Score candidate history edges without supervising mask_logits."""
+        candidate_edges = [int(edge_id) for edge_id in candidate_edges]
+        if self.cf_edge_selector == 'random':
+            return {
+                edge_id: float(self._cf_rng.random())
+                for edge_id in candidate_edges
+            }
+
+        if self.cf_edge_selector == 'representation':
+            # ``probe_mask`` has already removed p, so mask_rep is the exact
+            # representation state used to detect the fragile pseudo-positive.
+            item_vectors = self.mask_rep[self.num_user:]
+            pseudo_vector = item_vectors[int(pseudo_item_id)]
+            edge_items = self.forward_edge_items[torch.tensor(
+                candidate_edges,
+                dtype=torch.long,
+                device=self.forward_edge_items.device
+            )]
+            similarities = F.cosine_similarity(
+                item_vectors[edge_items],
+                pseudo_vector.unsqueeze(0),
+                dim=1
+            )
+            return {
+                edge_id: float(score.detach().cpu())
+                for edge_id, score in zip(candidate_edges, similarities)
+            }
+
+        # Use a detached full view here. The selector obtains gradients only
+        # with respect to this leaf mask and never accumulates parameter grads.
+        detached_full_view = (
+            full_view[0].detach(),
+            full_view[1].detach()
+        )
+        variable_mask = probe_mask.detach().clone()
+        variable_mask.requires_grad_(True)
+        with torch.enable_grad():
+            probe_embed = self.compute_result_embedding(
+                forward_edge_mask=variable_mask,
+                full_view=detached_full_view
+            )
+            scores = self._score_user_items(probe_embed, user_id)
+            self._mask_remaining_history(
+                scores,
+                user_id,
+                pseudo_item_id
+            )
+            margin = scores[int(pseudo_item_id)] - scores[int(boundary_item_id)]
+            gradient = torch.autograd.grad(
+                margin,
+                variable_mask,
+                allow_unused=False,
+                retain_graph=False,
+                create_graph=False
+            )[0]
+
+        estimated_damage = F.relu(
+            variable_mask.detach() * gradient.detach()
+        )
+        return {
+            edge_id: float(estimated_damage[edge_id].cpu())
+            for edge_id in candidate_edges
+        }
+
+    @staticmethod
+    def _rank_cf_candidates(candidate_edges, selector_scores):
+        return sorted(
+            (int(edge_id) for edge_id in candidate_edges),
+            key=lambda edge_id: (
+                -float(selector_scores.get(int(edge_id), float('-inf'))),
+                int(edge_id)
+            )
+        )
+
+    def _verify_cf_candidates(
+        self,
+        base_mask,
+        full_view,
+        user_id,
+        pseudo_edge_id,
+        pseudo_item_id,
+        boundary_item_id,
+        candidate_edges,
+        probe_margin
+    ):
+        best_edge = None
+        best_damage = float('-inf')
+        with torch.no_grad():
+            for edge_id in candidate_edges:
+                cf_mask = base_mask.clone()
+                cf_mask[int(pseudo_edge_id)] = 0.0
+                cf_mask[int(edge_id)] = 0.0
+                cf_embed = self.compute_result_embedding(
+                    forward_edge_mask=cf_mask,
+                    full_view=full_view
+                )
+                cf_scores = self._score_user_items(cf_embed, user_id)
+                self._mask_remaining_history(
+                    cf_scores,
+                    user_id,
+                    pseudo_item_id
+                )
+                cf_margin = (
+                    cf_scores[int(pseudo_item_id)]
+                    - cf_scores[int(boundary_item_id)]
+                )
+                damage = float(
+                    (probe_margin - float(cf_margin.detach().cpu()))
+                )
+                self.cf_stats['candidates_verified'] += 1
+                if (
+                    damage > best_damage
+                    or (
+                        damage == best_damage
+                        and best_edge is not None
+                        and int(edge_id) < int(best_edge)
+                    )
+                ):
+                    best_edge = int(edge_id)
+                    best_damage = damage
+        return best_edge, best_damage
 
     def _score_user_items(self, embedding, user_id):
         user_vector = embedding[int(user_id)]
@@ -326,6 +531,23 @@ class MASKED_GLORIA_CF(MASKED_GLORIA):
         valid = scores[boundary_items] > valid_floor
         not_pseudo = boundary_items != int(pseudo_item_id)
         return boundary_items[valid & not_pseudo].detach()
+
+    def _select_fixed_boundary_item(self, scores, pseudo_item_id):
+        """Return a fixed Top-K competitor, excluding the pseudo-positive."""
+        top_count = min(self.num_item, self.cf_k + 1)
+        if top_count <= 0 or self.cf_k > top_count:
+            return None
+        _, ranked_items = torch.topk(scores.detach(), k=top_count, dim=0)
+        valid_floor = torch.finfo(scores.dtype).min / 2.0
+        target = self.cf_k - 1
+        for index in range(target, top_count):
+            item_id = int(ranked_items[index].item())
+            if item_id == int(pseudo_item_id):
+                continue
+            if float(scores[item_id].detach().cpu()) <= valid_floor:
+                continue
+            return item_id
+        return None
 
     def _boundary_pairwise_loss(
         self,

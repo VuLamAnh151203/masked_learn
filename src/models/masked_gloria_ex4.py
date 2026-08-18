@@ -222,11 +222,12 @@ class MASKED_GLORIA_EX4(GeneralRecommender):
             device=self.device,
             features=self.id_embedding_masked.weight
         )
-        if config['fusion'] in ['add', 'pool']:
+        fusion = config['fusion'] or 'add'
+        if fusion in ['add', 'pool']:
             pass
-        elif config['fusion'] == 'Multi-Head Attention':
+        elif fusion == 'Multi-Head Attention':
             self.multihead_attn = nn.MultiheadAttention(embed_dim=64, num_heads=4)
-        elif config['fusion'] == 'Transformer':
+        elif fusion == 'Transformer':
             self.transformer = TransformerEncoder(64, num_heads= 4, layers=2)
         else:
             raise NotImplementedError

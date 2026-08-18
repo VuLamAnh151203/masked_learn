@@ -121,11 +121,12 @@ class LIGHTGCN(GeneralRecommender):
         # self.idh_gcn = GCN(self.dataset, batch_size, num_user, num_item, dim_x, self.aggr_mode,
         #                 num_layer=self.num_layer, has_feature=False, dropout=self.drop_rate, dim_latent=64,
         #                 device=self.device, features=self.id_embedding_high.weight)
-        if config['fusion'] in ['add', 'pool']:
+        fusion = config['fusion'] or 'add'
+        if fusion in ['add', 'pool']:
             pass
-        elif config['fusion'] == 'Multi-Head Attention':
+        elif fusion == 'Multi-Head Attention':
             self.multihead_attn = nn.MultiheadAttention(embed_dim=64, num_heads=4)
-        elif config['fusion'] == 'Transformer':
+        elif fusion == 'Transformer':
             self.transformer = TransformerEncoder(64, num_heads= 4, layers=2)
         else:
             raise NotImplementedError
