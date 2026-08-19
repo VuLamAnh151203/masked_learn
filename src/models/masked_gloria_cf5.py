@@ -2623,6 +2623,1343 @@
 
 # coding: utf-8
 
+# import itertools
+# import math
+# import random
+
+# import torch
+# import torch.nn.functional as F
+
+# from models.masked_gloria import MASKED_GLORIA
+
+
+# def _cfg(config, key, default):
+#     try:
+#         value = config[key]
+#     except Exception:
+#         return default
+#     return default if value is None else value
+
+
+# def _cfg_bool(config, key, default):
+#     value = _cfg(config, key, default)
+#     if isinstance(value, str):
+#         return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+#     return bool(value)
+
+
+# class MASKED_GLORIA_CF5(MASKED_GLORIA):
+#     """MASKED_GLORIA with broad mask consistency + target-specific residual.
+
+#     Broad loss:
+#         Keep the original history-prototype-guided mask ordering.
+
+#     Target-specific residual:
+#         Keep the learned static edge mask as a detached global/base prior, and
+#         let target similarity change the RELATIVE history contribution:
+
+#             q(e,p) = cos(z_e^mask, z_p^mask)
+
+#             alpha_base(e) ∝ stopgrad(m_e)
+#             alpha_target(e,p)
+#                 = softmax(log(stopgrad(m_e) + eps)
+#                           + gamma * q(e,p) / T_target)
+
+#         Equivalently:
+
+#             alpha_target(e,p) ∝ stopgrad(m_e)
+#                                   * exp(gamma * q(e,p) / T_target)
+
+#         This avoids sigmoid saturation when the learned masks are already near
+#         one and makes the target signal act directly on relative history
+#         weighting. The target-conditioned readout is compared with the
+#         base/global readout; their score difference is the target-specific
+#         residual score.
+
+#         The residual is also injected DIRECTLY into the recommendation score:
+
+#             s_new(u,p) = s_base(u,p) + eta * R(u,p)
+
+#         where:
+
+#             R(u,p) = <h_target(u,p) - h_global(u), z_p^mask>
+
+#         Thus the main ranking loss directly supervises whether the target-aware
+#         correction improves the positive-vs-negative ranking margin.
+
+#         The old residual-ranking auxiliary loss L_target is kept OPTIONAL for
+#         ablation, but defaults to zero in this version.
+
+#     The direct target-residual scorer is fully vectorized over each
+#     training mini-batch.
+
+#     This version intentionally contains NO counterfactual loss.
+#     """
+
+#     def __init__(self, config, dataset):
+#         super(MASKED_GLORIA_CF5, self).__init__(config, dataset)
+
+#         self.cf5_lambda = float(_cfg(config, 'cf5_lambda', 0.1))
+#         self.cf5_temperature = float(
+#             _cfg(config, 'cf5_temperature', 1.0)
+#         )
+#         self.cf5_warmup_ratio = float(
+#             _cfg(config, 'cf5_warmup_ratio', 0.10)
+#         )
+#         configured_warmup_epochs = int(
+#             _cfg(config, 'cf5_warmup_epochs', 50)
+#         )
+#         self.cf5_user_ratio = float(_cfg(config, 'cf5_user_ratio', 0.10))
+#         self.cf5_batch_size = int(_cfg(config, 'cf5_batch_size', 8))
+#         self.cf5_pair_count = int(_cfg(config, 'cf5_pair_count', 32))
+#         self.cf5_min_history = int(_cfg(config, 'cf5_min_history', 2))
+#         self.cf5_similarity_eps = float(
+#             _cfg(config, 'cf5_similarity_eps', 1e-6)
+#         )
+#         self.cf5_seed_offset = int(
+#             _cfg(config, 'cf5_seed_offset', 20000)
+#         )
+#         self.cf5_log_stats = _cfg_bool(config, 'cf5_log_stats', True)
+
+#         # -------------------------------------------------------------
+#         # Target-specific residual configuration.
+#         # -------------------------------------------------------------
+#         # Optional old auxiliary residual-ranking loss. Keep this at 0.0 for
+#         # the clean "direct residual scoring" experiment.
+#         self.cf5_target_lambda = float(
+#             _cfg(config, 'cf5_target_lambda', 0.0)
+#         )
+#         # Strength of target-specific relative reweighting.
+#         # Backward-compatible fallback: an old cf5_target_beta value is used
+#         # only when cf5_target_gamma is not provided.
+#         self.cf5_target_gamma = float(
+#             _cfg(
+#                 config,
+#                 'cf5_target_gamma',
+#                 _cfg(config, 'cf5_target_beta', 1.0)
+#             )
+#         )
+#         self.cf5_target_temperature = float(
+#             _cfg(config, 'cf5_target_temperature', 1.0)
+#         )
+#         self.cf5_target_loss_temperature = float(
+#             _cfg(config, 'cf5_target_loss_temperature', 1.0)
+#         )
+#         self.cf5_target_user_ratio = float(
+#             _cfg(config, 'cf5_target_user_ratio', self.cf5_user_ratio)
+#         )
+#         self.cf5_target_batch_size = int(
+#             _cfg(config, 'cf5_target_batch_size', self.cf5_batch_size)
+#         )
+#         self.cf5_target_mask_eps = float(
+#             _cfg(config, 'cf5_target_mask_eps', 1e-6)
+#         )
+
+#         # -------------------------------------------------------------
+#         # Direct target-residual scoring configuration.
+#         # -------------------------------------------------------------
+#         # Final training/evaluation score:
+#         #     s_new = s_base + eta * residual_score
+#         self.cf5_target_score_eta = float(
+#             _cfg(config, 'cf5_target_score_eta', 0.1)
+#         )
+#         self.cf5_target_full_sort_chunk_size = int(
+#             _cfg(config, 'cf5_target_full_sort_chunk_size', 2048)
+#         )
+
+#         # 0 keeps the full graph history (same semantics as the old scorer).
+#         # A positive value keeps only the last N forward edges per user and can
+#         # be used to cap B x H memory on very high-degree datasets.
+#         self.cf5_target_vectorized_max_history = int(
+#             _cfg(config, 'cf5_target_vectorized_max_history', 0)
+#         )
+
+#         max_epochs = int(_cfg(config, 'epochs', 1000))
+#         if configured_warmup_epochs >= 0:
+#             self.cf5_warmup_epochs = configured_warmup_epochs
+#         else:
+#             self.cf5_warmup_epochs = int(
+#                 math.ceil(max_epochs * self.cf5_warmup_ratio)
+#             )
+
+#         configured_score_warmup = int(
+#             _cfg(
+#                 config,
+#                 'cf5_target_score_warmup_epochs',
+#                 self.cf5_warmup_epochs
+#             )
+#         )
+#         self.cf5_target_score_warmup_epochs = configured_score_warmup
+
+#         self._validate_cf5_config()
+#         self.current_epoch = 0
+#         self._cf5_rng = random.Random(self.cf5_seed_offset)
+#         self.user_to_edge_ids = self._build_cf5_history()
+
+#         # CSR-like index used by the fully vectorized target scorer.
+#         self._build_cf5_vectorized_history_index()
+
+#         self.cf5_stats = self._new_cf5_stats()
+
+#     def _validate_cf5_config(self):
+#         if self.cf5_lambda < 0.0:
+#             raise ValueError('cf5_lambda must be non-negative.')
+#         if self.cf5_temperature <= 0.0:
+#             raise ValueError('cf5_temperature must be positive.')
+#         if not 0.0 <= self.cf5_user_ratio <= 1.0:
+#             raise ValueError('cf5_user_ratio must be in [0, 1].')
+#         if self.cf5_batch_size <= 0:
+#             raise ValueError('cf5_batch_size must be positive.')
+#         if self.cf5_pair_count <= 0:
+#             raise ValueError('cf5_pair_count must be positive.')
+#         if self.cf5_min_history < 2:
+#             raise ValueError('cf5_min_history must be at least 2.')
+#         if self.cf5_similarity_eps < 0.0:
+#             raise ValueError('cf5_similarity_eps must be non-negative.')
+#         if self.cf5_warmup_epochs < 0:
+#             raise ValueError('cf5_warmup_epochs must be non-negative.')
+
+#         if self.cf5_target_lambda < 0.0:
+#             raise ValueError('cf5_target_lambda must be non-negative.')
+#         if self.cf5_target_gamma < 0.0:
+#             raise ValueError('cf5_target_gamma must be non-negative.')
+#         if self.cf5_target_temperature <= 0.0:
+#             raise ValueError('cf5_target_temperature must be positive.')
+#         if self.cf5_target_loss_temperature <= 0.0:
+#             raise ValueError(
+#                 'cf5_target_loss_temperature must be positive.'
+#             )
+#         if not 0.0 <= self.cf5_target_user_ratio <= 1.0:
+#             raise ValueError('cf5_target_user_ratio must be in [0, 1].')
+#         if self.cf5_target_batch_size <= 0:
+#             raise ValueError('cf5_target_batch_size must be positive.')
+#         if not 0.0 < self.cf5_target_mask_eps < 0.5:
+#             raise ValueError(
+#                 'cf5_target_mask_eps must be in (0, 0.5).'
+#             )
+#         if self.cf5_target_score_eta < 0.0:
+#             raise ValueError('cf5_target_score_eta must be non-negative.')
+#         if self.cf5_target_score_warmup_epochs < 0:
+#             raise ValueError(
+#                 'cf5_target_score_warmup_epochs must be non-negative.'
+#             )
+#         if self.cf5_target_full_sort_chunk_size <= 0:
+#             raise ValueError(
+#                 'cf5_target_full_sort_chunk_size must be positive.'
+#             )
+#         if self.cf5_target_vectorized_max_history < 0:
+#             raise ValueError(
+#                 'cf5_target_vectorized_max_history must be non-negative.'
+#             )
+
+#     def _build_cf5_history(self):
+#         user_to_edge_ids = [[] for _ in range(self.num_user)]
+#         edge_users = self.forward_edge_users.detach().cpu().tolist()
+#         for edge_id, user_id in enumerate(edge_users):
+#             user_to_edge_ids[int(user_id)].append(int(edge_id))
+#         return tuple(tuple(edge_ids) for edge_ids in user_to_edge_ids)
+
+#     def _build_cf5_vectorized_history_index(self):
+#         """Precompute a CSR-like user -> forward-edge mapping.
+
+#         Buffers:
+#             cf5_history_sorted_edge_ids : [E]
+#             cf5_history_counts          : [num_user]
+#             cf5_history_offsets         : [num_user + 1]
+
+#         The original forward edges do not have to be grouped by user.
+#         """
+#         edge_users = self.forward_edge_users.long()
+
+#         try:
+#             sorted_edge_ids = torch.argsort(edge_users, stable=True)
+#         except TypeError:
+#             sorted_edge_ids = torch.argsort(edge_users)
+
+#         counts = torch.bincount(
+#             edge_users,
+#             minlength=self.num_user
+#         ).long()
+
+#         offsets = torch.zeros(
+#             self.num_user + 1,
+#             dtype=torch.long,
+#             device=edge_users.device
+#         )
+#         offsets[1:] = torch.cumsum(counts, dim=0)
+
+#         self.register_buffer(
+#             'cf5_history_sorted_edge_ids',
+#             sorted_edge_ids
+#         )
+#         self.register_buffer(
+#             'cf5_history_counts',
+#             counts
+#         )
+#         self.register_buffer(
+#             'cf5_history_offsets',
+#             offsets
+#         )
+
+#     def _gather_vectorized_batch_history(
+#         self,
+#         users,
+#         positives,
+#         negatives=None
+#     ):
+#         """Gather all batch histories as padded [B, H] tensors.
+
+#         This performs no Python loop over batch rows. Both current p+ and p-
+#         are excluded during training, exactly like the previous implementation.
+#         """
+#         users = users.long().view(-1)
+#         positives = positives.long().view(-1)
+
+#         if negatives is not None:
+#             negatives = negatives.long().view(-1)
+
+#         batch_size = users.numel()
+#         device = users.device
+
+#         counts = self.cf5_history_counts[users]
+#         starts = self.cf5_history_offsets[users]
+
+#         max_history = self.cf5_target_vectorized_max_history
+
+#         if max_history > 0:
+#             lengths = counts.clamp(max=max_history)
+#             # Keep the last N edges for capped mode.
+#             starts = starts + (counts - lengths)
+#         else:
+#             lengths = counts
+
+#         if batch_size == 0:
+#             empty_ids = torch.empty(
+#                 (0, 0),
+#                 dtype=torch.long,
+#                 device=device
+#             )
+#             empty_mask = torch.empty(
+#                 (0, 0),
+#                 dtype=torch.bool,
+#                 device=device
+#             )
+#             return empty_ids, empty_ids, empty_mask
+
+#         # One scalar synchronization per mini-batch is enough to size the
+#         # padded tensor; the old implementation synchronized once per row.
+#         batch_max_history = int(lengths.max().detach().item())
+
+#         if batch_max_history == 0:
+#             empty_ids = torch.empty(
+#                 (batch_size, 0),
+#                 dtype=torch.long,
+#                 device=device
+#             )
+#             empty_mask = torch.empty(
+#                 (batch_size, 0),
+#                 dtype=torch.bool,
+#                 device=device
+#             )
+#             return empty_ids, empty_ids, empty_mask
+
+#         relative_pos = torch.arange(
+#             batch_max_history,
+#             dtype=torch.long,
+#             device=device
+#         ).unsqueeze(0)
+
+#         padded_valid = relative_pos < lengths.unsqueeze(1)
+
+#         sorted_positions = starts.unsqueeze(1) + relative_pos
+#         sorted_positions = sorted_positions.clamp(
+#             max=self.cf5_history_sorted_edge_ids.numel() - 1
+#         )
+
+#         edge_ids = self.cf5_history_sorted_edge_ids[sorted_positions]
+#         history_item_ids = self.forward_edge_items[edge_ids]
+
+#         history_valid = padded_valid & (
+#             history_item_ids != positives.unsqueeze(1)
+#         )
+
+#         if negatives is not None:
+#             history_valid = history_valid & (
+#                 history_item_ids != negatives.unsqueeze(1)
+#             )
+
+#         return edge_ids, history_item_ids, history_valid
+
+#     def _vectorized_target_residual_pair(
+#         self,
+#         users,
+#         positives,
+#         negatives
+#     ):
+#         """Compute positive/negative target residuals for a whole batch.
+
+#         Shapes:
+#             history_rep      [B, H, D]
+#             similarity_*     [B, H]
+#             target_weight_*  [B, H]
+#             residual_*       [B]
+
+#         No per-row target scoring loop is used.
+#         """
+#         users = users.long().view(-1)
+#         positives = positives.long().view(-1)
+#         negatives = negatives.long().view(-1)
+
+#         batch_size = users.numel()
+#         item_rep = self.mask_rep[self.num_user:]
+
+#         edge_ids, history_item_ids, history_valid = (
+#             self._gather_vectorized_batch_history(
+#                 users,
+#                 positives,
+#                 negatives
+#             )
+#         )
+
+#         if history_item_ids.size(1) == 0:
+#             zero_pos = item_rep[positives].sum(dim=1) * 0.0
+#             zero_neg = item_rep[negatives].sum(dim=1) * 0.0
+#             valid = torch.zeros(
+#                 batch_size,
+#                 dtype=torch.bool,
+#                 device=users.device
+#             )
+#             return zero_pos, zero_neg, valid
+
+#         history_count = history_valid.sum(dim=1)
+#         valid_rows = history_count >= self.cf5_min_history
+
+#         history_rep = item_rep[history_item_ids]  # [B, H, D]
+#         pos_rep = item_rep[positives]             # [B, D]
+#         neg_rep = item_rep[negatives]             # [B, D]
+
+#         history_mask = self.get_forward_edge_mask()[edge_ids]
+#         eps = self.cf5_target_mask_eps
+#         detached_mask = history_mask.detach().clamp_min(eps)
+
+#         # Softmax requires at least one valid position. Rows that have no
+#         # usable history get a dummy first entry and are zeroed afterwards.
+#         safe_valid = history_valid.clone()
+#         has_any = safe_valid.any(dim=1)
+#         if (~has_any).any():
+#             safe_valid[~has_any, 0] = True
+
+#         neg_large = torch.finfo(history_rep.dtype).min
+
+#         base_logits = torch.log(detached_mask).masked_fill(
+#             ~safe_valid,
+#             neg_large
+#         )
+#         global_weight = torch.softmax(base_logits, dim=1)
+
+#         history_norm = F.normalize(history_rep, dim=2)
+#         pos_norm = F.normalize(pos_rep, dim=1)
+#         neg_norm = F.normalize(neg_rep, dim=1)
+
+#         pos_similarity = torch.sum(
+#             history_norm * pos_norm.unsqueeze(1),
+#             dim=2
+#         )
+#         neg_similarity = torch.sum(
+#             history_norm * neg_norm.unsqueeze(1),
+#             dim=2
+#         )
+
+#         scale = (
+#             self.cf5_target_gamma
+#             / self.cf5_target_temperature
+#         )
+
+#         pos_logits = (
+#             base_logits + scale * pos_similarity
+#         ).masked_fill(~safe_valid, neg_large)
+
+#         neg_logits = (
+#             base_logits + scale * neg_similarity
+#         ).masked_fill(~safe_valid, neg_large)
+
+#         pos_weight = torch.softmax(pos_logits, dim=1)
+#         neg_weight = torch.softmax(neg_logits, dim=1)
+
+#         global_history = torch.bmm(
+#             global_weight.unsqueeze(1),
+#             history_rep
+#         ).squeeze(1)
+
+#         pos_history = torch.bmm(
+#             pos_weight.unsqueeze(1),
+#             history_rep
+#         ).squeeze(1)
+
+#         neg_history = torch.bmm(
+#             neg_weight.unsqueeze(1),
+#             history_rep
+#         ).squeeze(1)
+
+#         pos_residual = torch.sum(
+#             (pos_history - global_history) * pos_rep,
+#             dim=1
+#         )
+#         neg_residual = torch.sum(
+#             (neg_history - global_history) * neg_rep,
+#             dim=1
+#         )
+
+#         # Invalid/short-history rows exactly fall back to base score.
+#         zero_pos = pos_rep.sum(dim=1) * 0.0
+#         zero_neg = neg_rep.sum(dim=1) * 0.0
+
+#         pos_residual = torch.where(
+#             valid_rows,
+#             pos_residual,
+#             zero_pos
+#         )
+#         neg_residual = torch.where(
+#             valid_rows,
+#             neg_residual,
+#             zero_neg
+#         )
+
+#         return pos_residual, neg_residual, valid_rows
+
+#     @staticmethod
+#     def _new_cf5_stats():
+#         return {
+#             # Broad mask consistency.
+#             'samples': 0,
+#             'eligible': 0,
+#             'pairs': 0,
+#             'used': 0,
+#             'loss_sum': 0.0,
+#             'similarity_gap_sum': 0.0,
+
+#             # Target-specific residual.
+#             'target_samples': 0,
+#             'target_eligible': 0,
+#             'target_used': 0,
+#             'target_loss_sum': 0.0,
+#             'target_pos_residual_sum': 0.0,
+#             'target_neg_residual_sum': 0.0,
+#             'target_residual_gap_sum': 0.0,
+#             'target_weight_shift_sum': 0.0,
+#             'target_pos_similarity_sum': 0.0,
+#             'target_neg_similarity_sum': 0.0,
+
+#             # Direct residual scoring inside main recommendation loss.
+#             'score_used': 0,
+#             'score_base_margin_sum': 0.0,
+#             'score_pos_residual_sum': 0.0,
+#             'score_neg_residual_sum': 0.0,
+#             'score_residual_gap_sum': 0.0,
+#             'score_corrected_margin_sum': 0.0,
+#         }
+
+#     def set_training_epoch(self, epoch_idx):
+#         epoch_idx = int(epoch_idx)
+#         if epoch_idx < 0:
+#             raise ValueError('epoch_idx must be non-negative.')
+#         self.current_epoch = epoch_idx
+#         self._cf5_rng.seed(self.cf5_seed_offset + epoch_idx)
+
+#     def pre_epoch_processing(self):
+#         self.cf5_stats = self._new_cf5_stats()
+
+#     def post_epoch_processing(self):
+#         if not self.cf5_log_stats:
+#             return None
+
+#         used = max(self.cf5_stats['used'], 1)
+#         target_used = max(self.cf5_stats['target_used'], 1)
+#         score_used = max(self.cf5_stats['score_used'], 1)
+
+#         return (
+#             'broad-mask + direct relative target score: '
+#             'epoch={epoch}, warmup_epochs={warmup}, '
+#             'score_warmup={score_warmup}, '
+#             'broad_lambda={lambda_cf5:.6f}, '
+#             'broad_loss={broad_loss:.6f}, '
+#             'broad_similarity_gap={broad_gap:.6f}, '
+#             'target_gamma={target_gamma:.6f}, '
+#             'target_temperature={target_temperature:.6f}, '
+#             'target_score_eta={score_eta:.6f}, '
+#             'score_used={score_used_count}, '
+#             'score_base_margin={base_margin:.6f}, '
+#             'score_pos_residual={score_pos_residual:.6f}, '
+#             'score_neg_residual={score_neg_residual:.6f}, '
+#             'score_residual_gap={score_residual_gap:.6f}, '
+#             'score_corrected_margin={corrected_margin:.6f}, '
+#             'aux_target_lambda={target_lambda:.6f}, '
+#             'aux_target_loss={target_loss:.6f}, '
+#             'aux_target_residual_gap={target_residual_gap:.6f}, '
+#             'aux_target_weight_shift={target_weight_shift:.6f}, '
+#             'aux_target_pos_similarity={target_pos_similarity:.6f}, '
+#             'aux_target_neg_similarity={target_neg_similarity:.6f}'
+#         ).format(
+#             epoch=int(self.current_epoch),
+#             warmup=int(self.cf5_warmup_epochs),
+#             score_warmup=int(self.cf5_target_score_warmup_epochs),
+#             lambda_cf5=float(self.cf5_lambda),
+#             broad_loss=float(self.cf5_stats['loss_sum'] / used),
+#             broad_gap=float(self.cf5_stats['similarity_gap_sum'] / used),
+#             target_gamma=float(self.cf5_target_gamma),
+#             target_temperature=float(self.cf5_target_temperature),
+#             score_eta=float(self.cf5_target_score_eta),
+#             score_used_count=int(self.cf5_stats['score_used']),
+#             base_margin=float(
+#                 self.cf5_stats['score_base_margin_sum'] / score_used
+#             ),
+#             score_pos_residual=float(
+#                 self.cf5_stats['score_pos_residual_sum'] / score_used
+#             ),
+#             score_neg_residual=float(
+#                 self.cf5_stats['score_neg_residual_sum'] / score_used
+#             ),
+#             score_residual_gap=float(
+#                 self.cf5_stats['score_residual_gap_sum'] / score_used
+#             ),
+#             corrected_margin=float(
+#                 self.cf5_stats['score_corrected_margin_sum'] / score_used
+#             ),
+#             target_lambda=float(self.cf5_target_lambda),
+#             target_loss=float(
+#                 self.cf5_stats['target_loss_sum'] / target_used
+#             ),
+#             target_residual_gap=float(
+#                 self.cf5_stats['target_residual_gap_sum'] / target_used
+#             ),
+#             target_weight_shift=float(
+#                 self.cf5_stats['target_weight_shift_sum'] / target_used
+#             ),
+#             target_pos_similarity=float(
+#                 self.cf5_stats['target_pos_similarity_sum'] / target_used
+#             ),
+#             target_neg_similarity=float(
+#                 self.cf5_stats['target_neg_similarity_sum'] / target_used
+#             ),
+#         )
+
+#     def _is_cf5_active(self):
+#         return (
+#             self.training
+#             and (
+#                 self.cf5_lambda > 0.0
+#                 or self.cf5_target_lambda > 0.0
+#             )
+#             and (
+#                 self.cf5_user_ratio > 0.0
+#                 or self.cf5_target_user_ratio > 0.0
+#             )
+#             and self.current_epoch >= self.cf5_warmup_epochs
+#         )
+
+#     def _target_score_active_for_training(self):
+#         return (
+#             self.training
+#             and self.cf5_target_score_eta > 0.0
+#             and self.current_epoch >= self.cf5_target_score_warmup_epochs
+#         )
+
+#     def _calculate_rec_loss(self, interaction):
+#         """Main BPR loss with optional target-specific residual correction.
+
+#         Before score warmup:
+#             margin = s_pos_base - s_neg_base
+
+#         After score warmup:
+#             s_pos_new = s_pos_base + eta * R_pos
+#             s_neg_new = s_neg_base + eta * R_neg
+
+#             margin_new = margin_base + eta * (R_pos - R_neg)
+
+#         Therefore the target-specific residual is trained DIRECTLY by the main
+#         recommendation objective, rather than only through L_target.
+#         """
+#         pos_scores, neg_scores = self.forward(interaction)
+
+#         if not self._target_score_active_for_training():
+#             return -torch.mean(
+#                 torch.log2(torch.sigmoid(pos_scores - neg_scores))
+#             )
+
+#         pos_residual, neg_residual, valid = (
+#             self._calculate_batch_target_residual_scores(interaction)
+#         )
+
+#         # Invalid/too-short histories receive zero correction, so their score
+#         # exactly falls back to the base recommender.
+#         corrected_pos = (
+#             pos_scores
+#             + self.cf5_target_score_eta * pos_residual
+#         )
+#         corrected_neg = (
+#             neg_scores
+#             + self.cf5_target_score_eta * neg_residual
+#         )
+
+#         with torch.no_grad():
+#             # Pack all diagnostics into one CPU transfer/synchronization.
+#             valid_float = valid.to(pos_scores.dtype)
+#             base_margin_all = pos_scores - neg_scores
+#             residual_gap_all = pos_residual - neg_residual
+#             corrected_margin_all = corrected_pos - corrected_neg
+
+#             packed = torch.stack([
+#                 valid_float.sum(),
+#                 (base_margin_all * valid_float).sum(),
+#                 (pos_residual * valid_float).sum(),
+#                 (neg_residual * valid_float).sum(),
+#                 (residual_gap_all * valid_float).sum(),
+#                 (corrected_margin_all * valid_float).sum(),
+#             ]).detach().cpu().tolist()
+
+#             valid_count = int(packed[0])
+#             if valid_count > 0:
+#                 self.cf5_stats['score_used'] += valid_count
+#                 self.cf5_stats['score_base_margin_sum'] += packed[1]
+#                 self.cf5_stats['score_pos_residual_sum'] += packed[2]
+#                 self.cf5_stats['score_neg_residual_sum'] += packed[3]
+#                 self.cf5_stats['score_residual_gap_sum'] += packed[4]
+#                 self.cf5_stats['score_corrected_margin_sum'] += packed[5]
+
+#         return -torch.mean(
+#             torch.log2(
+#                 torch.sigmoid(corrected_pos - corrected_neg)
+#             )
+#         )
+
+#     def calculate_loss(self, interaction):
+#         loss_rec = self._calculate_rec_loss(interaction)
+#         if not self._is_cf5_active():
+#             self.result_embed = None
+#             return loss_rec
+
+#         if self.cf5_lambda > 0.0:
+#             loss_mask_relation = self._calculate_mask_relation_loss(
+#                 interaction,
+#                 loss_rec
+#             )
+#         else:
+#             loss_mask_relation = loss_rec * 0.0
+
+#         if self.cf5_target_lambda > 0.0:
+#             loss_target_residual = self._calculate_target_residual_loss(
+#                 interaction,
+#                 loss_rec
+#             )
+#         else:
+#             loss_target_residual = loss_rec * 0.0
+
+#         weighted_auxiliary = (
+#             self.cf5_lambda * loss_mask_relation
+#             + self.cf5_target_lambda * loss_target_residual
+#         )
+
+#         self.result_embed = None
+
+#         # Preserve the original trainer interface.
+#         return loss_rec, weighted_auxiliary
+
+#     def _calculate_batch_target_residual_scores(self, interaction):
+#         """Fully vectorized R_pos / R_neg for every training row."""
+#         users = interaction[0].view(-1)
+#         positives = interaction[1].view(-1)
+#         negatives = interaction[2].view(-1)
+
+#         batch_size = int(users.numel())
+
+#         if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+#             zero = torch.zeros(
+#                 batch_size,
+#                 dtype=torch.float32,
+#                 device=users.device
+#             )
+#             valid = torch.zeros(
+#                 batch_size,
+#                 dtype=torch.bool,
+#                 device=users.device
+#             )
+#             return zero, zero, valid
+
+#         return self._vectorized_target_residual_pair(
+#             users,
+#             positives,
+#             negatives
+#         )
+
+#     def _sample_cf5_users(self, interaction):
+#         if interaction is None or len(interaction) == 0:
+#             return []
+
+#         users = torch.unique(interaction[0].detach()).cpu().tolist()
+#         users = [int(user_id) for user_id in users]
+#         if not users:
+#             return []
+
+#         sample_count = int(math.ceil(len(users) * self.cf5_user_ratio))
+#         sample_count = max(1, sample_count)
+#         sample_count = min(sample_count, self.cf5_batch_size, len(users))
+#         return self._cf5_rng.sample(users, sample_count)
+
+#     def _sample_cf5_pairs(self, history_size):
+#         total_pairs = history_size * (history_size - 1) // 2
+#         if total_pairs <= self.cf5_pair_count:
+#             return list(itertools.combinations(range(history_size), 2))
+
+#         pairs = set()
+#         while len(pairs) < self.cf5_pair_count:
+#             left = self._cf5_rng.randrange(history_size)
+#             right = self._cf5_rng.randrange(history_size)
+#             if left == right:
+#                 continue
+#             pairs.add(tuple(sorted((left, right))))
+#         return list(pairs)
+
+#     def _calculate_mask_relation_loss(self, interaction, reference_loss):
+#         """Apply pairwise similarity ordering to current mask weights."""
+#         sampled_users = self._sample_cf5_users(interaction)
+#         self.cf5_stats['samples'] += len(sampled_users)
+#         if not sampled_users or self.result_embed is None:
+#             return reference_loss * 0.0
+
+#         if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+#             return reference_loss * 0.0
+
+#         item_rep = self.mask_rep[self.num_user:]
+#         mask_weights = self.get_forward_edge_mask()
+#         losses = []
+
+#         for user_id in sampled_users:
+#             edge_ids = self.user_to_edge_ids[int(user_id)]
+#             if len(edge_ids) < self.cf5_min_history:
+#                 continue
+
+#             self.cf5_stats['eligible'] += 1
+#             edge_tensor = torch.tensor(
+#                 edge_ids,
+#                 dtype=torch.long,
+#                 device=self.forward_edge_users.device
+#             )
+#             item_ids = self.forward_edge_items[edge_tensor]
+#             prototype = item_rep[item_ids].mean(dim=0)
+#             relevance = F.cosine_similarity(
+#                 item_rep[item_ids],
+#                 prototype.unsqueeze(0),
+#                 dim=1
+#             ).detach()
+
+#             pair_positions = self._sample_cf5_pairs(len(edge_ids))
+
+#             for left_pos, right_pos in pair_positions:
+#                 relevance_gap = (
+#                     relevance[left_pos] - relevance[right_pos]
+#                 )
+#                 if abs(float(relevance_gap.detach().cpu())) <= self.cf5_similarity_eps:
+#                     continue
+
+#                 left_edge = int(edge_ids[left_pos])
+#                 right_edge = int(edge_ids[right_pos])
+#                 mask_gap = mask_weights[left_edge] - mask_weights[right_edge]
+#                 direction = torch.sign(relevance_gap)
+#                 pair_loss = F.softplus(
+#                     -self.cf5_temperature * direction * mask_gap
+#                 )
+#                 losses.append(pair_loss)
+
+#                 with torch.no_grad():
+#                     self.cf5_stats['pairs'] += 1
+#                     self.cf5_stats['used'] += 1
+#                     self.cf5_stats['loss_sum'] += float(
+#                         pair_loss.detach().cpu()
+#                     )
+#                     self.cf5_stats['similarity_gap_sum'] += float(
+#                         relevance_gap.abs().detach().cpu()
+#                     )
+
+#         if not losses:
+#             return reference_loss * 0.0
+#         return torch.stack(losses).mean()
+
+#     def _sample_target_users(self, interaction):
+#         """Sample users for the target-specific residual auxiliary task."""
+#         if interaction is None or len(interaction) == 0:
+#             return []
+
+#         users = torch.unique(interaction[0].detach()).cpu().tolist()
+#         users = [int(user_id) for user_id in users]
+#         if not users:
+#             return []
+
+#         sample_count = int(
+#             math.ceil(len(users) * self.cf5_target_user_ratio)
+#         )
+#         sample_count = max(1, sample_count)
+#         sample_count = min(
+#             sample_count,
+#             self.cf5_target_batch_size,
+#             len(users)
+#         )
+#         return self._cf5_rng.sample(users, sample_count)
+
+#     @staticmethod
+#     def _build_batch_pos_neg_targets(interaction):
+#         """Map batch users to current (positive, negative) item pairs.
+
+#         Assumes the standard layout already used by the base recommender:
+#             interaction[0] -> user ids
+#             interaction[1] -> positive item ids
+#             interaction[2] -> negative item ids
+#         """
+#         if interaction is None or len(interaction) < 3:
+#             return {}
+
+#         users = interaction[0].detach().view(-1).cpu().tolist()
+#         positives = interaction[1].detach().view(-1).cpu().tolist()
+#         negatives = interaction[2].detach().view(-1).cpu().tolist()
+
+#         if not (
+#             len(users) == len(positives) == len(negatives)
+#         ):
+#             return {}
+
+#         mapping = {}
+#         for user_id, pos_item, neg_item in zip(
+#             users, positives, negatives
+#         ):
+#             mapping.setdefault(int(user_id), []).append(
+#                 (int(pos_item), int(neg_item))
+#             )
+#         return mapping
+
+#     def _target_conditioned_residual_score(
+#         self,
+#         history_rep,
+#         target_rep,
+#         base_mask
+#     ):
+#         """Compute target-specific residual using relative mask weighting.
+
+#         Target relevance:
+#             q(e,p) = cos(z_e, z_p)
+
+#         Base/global history weights:
+#             alpha_base(e)
+#                 = stopgrad(m_e) / sum_j stopgrad(m_j)
+
+#         Target-conditioned history weights:
+#             alpha_target(e,p)
+#                 = softmax(
+#                     log(stopgrad(m_e) + eps)
+#                     + gamma * q(e,p) / T_target
+#                   )
+
+#         Equivalently:
+#             alpha_target(e,p)
+#                 proportional to
+#                 stopgrad(m_e) * exp(gamma * q(e,p) / T_target)
+
+#         Thus the broad/static mask remains a GLOBAL PRIOR, while target
+#         similarity only changes the RELATIVE contribution of history items.
+#         This avoids the old sigmoid(logit(m)+delta) saturation when m is near 1.
+
+#         We then define:
+#             h_global     = sum_e alpha_base(e) z_e
+#             h_target     = sum_e alpha_target(e,p) z_e
+#             residual_rep = h_target - h_global
+#             residual_score = <residual_rep, z_p>
+
+#         The base mask is detached in this auxiliary path, so the target loss
+#         does not directly rewrite the static mask values. Gradients still flow
+#         through q(e,p), history_rep, target_rep, and therefore shape the masked
+#         representations.
+#         """
+#         if history_rep.numel() == 0:
+#             zero = target_rep.sum() * 0.0
+#             return zero, zero, zero
+
+#         eps = self.cf5_target_mask_eps
+
+#         # Candidate-conditioned relevance from the current masked branch.
+#         target_similarity = F.cosine_similarity(
+#             history_rep,
+#             target_rep.unsqueeze(0),
+#             dim=1
+#         )
+
+#         # The broad/static mask is only a detached global prior here.
+#         base_mask_detached = base_mask.detach().clamp_min(eps)
+
+#         # Base/global normalized history weights. Using softmax(log(m)) is
+#         # numerically equivalent to m / sum(m), while making the relationship
+#         # to target-conditioned logits explicit.
+#         base_logits = torch.log(base_mask_detached)
+#         global_weight = torch.softmax(base_logits, dim=0)
+
+#         # New relative target correction.
+#         # A positive q increases an edge's RELATIVE contribution; a negative q
+#         # decreases it. There is no extra sigmoid over an already-near-one mask.
+#         target_logits = (
+#             base_logits
+#             + self.cf5_target_gamma
+#             * target_similarity
+#             / self.cf5_target_temperature
+#         )
+#         target_weight = torch.softmax(target_logits, dim=0)
+
+#         global_history = torch.sum(
+#             global_weight.unsqueeze(-1) * history_rep,
+#             dim=0
+#         )
+#         target_history = torch.sum(
+#             target_weight.unsqueeze(-1) * history_rep,
+#             dim=0
+#         )
+
+#         residual_rep = target_history - global_history
+
+#         # Auxiliary contribution score: how much the target-specific readout
+#         # moves the history representation in the target item's direction.
+#         residual_score = torch.sum(
+#             residual_rep * target_rep,
+#             dim=-1
+#         )
+
+#         # Diagnostic: actual change in NORMALIZED history contribution, which
+#         # is the relevant quantity for this formulation.
+#         mean_weight_shift = (
+#             target_weight - global_weight
+#         ).abs().mean()
+
+#         mean_target_similarity = target_similarity.mean()
+
+#         return (
+#             residual_score,
+#             mean_weight_shift,
+#             mean_target_similarity
+#         )
+
+#     def _calculate_target_residual_loss(
+
+#         self,
+#         interaction,
+#         reference_loss
+#     ):
+#         """Train target-specific residual without any counterfactual objective.
+
+#         For each sampled user and current positive/negative pair:
+
+#             R_pos = residual_score(u, p+)
+#             R_neg = residual_score(u, p-)
+
+#         The auxiliary objective asks the target-conditioned correction to help
+#         the positive item more than the negative item:
+
+#             L_target = softplus(
+#                 (R_neg - R_pos) / T_loss
+#             )
+
+#         This auxiliary objective is OPTIONAL in this file. The main
+#         recommendation loss already consumes the residual score directly via
+#         s_new = s_base + eta * R. Set cf5_target_lambda=0.0 for the clean
+#         direct-scoring experiment.
+#         """
+#         if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+#             return reference_loss * 0.0
+
+#         target_pairs_by_user = self._build_batch_pos_neg_targets(
+#             interaction
+#         )
+#         if not target_pairs_by_user:
+#             return reference_loss * 0.0
+
+#         sampled_users = self._sample_target_users(interaction)
+#         self.cf5_stats['target_samples'] += len(sampled_users)
+
+#         if not sampled_users:
+#             return reference_loss * 0.0
+
+#         item_rep = self.mask_rep[self.num_user:]
+#         mask_weights = self.get_forward_edge_mask()
+
+#         losses = []
+
+#         for user_id in sampled_users:
+#             user_pairs = target_pairs_by_user.get(int(user_id), [])
+#             if not user_pairs:
+#                 continue
+
+#             pos_item, neg_item = self._cf5_rng.choice(user_pairs)
+
+#             if (
+#                 pos_item < 0
+#                 or neg_item < 0
+#                 or pos_item >= item_rep.size(0)
+#                 or neg_item >= item_rep.size(0)
+#             ):
+#                 continue
+
+#             edge_ids = self.user_to_edge_ids[int(user_id)]
+#             if len(edge_ids) < self.cf5_min_history:
+#                 continue
+
+#             edge_tensor = torch.tensor(
+#                 edge_ids,
+#                 dtype=torch.long,
+#                 device=self.forward_edge_users.device
+#             )
+#             history_item_ids = self.forward_edge_items[edge_tensor]
+
+#             # Avoid trivial cos(z_p, z_p)=1 if a batch target is already in
+#             # the user's graph history.
+#             keep = (
+#                 (history_item_ids != pos_item)
+#                 & (history_item_ids != neg_item)
+#             )
+#             history_item_ids = history_item_ids[keep]
+#             history_edge_tensor = edge_tensor[keep]
+
+#             if history_item_ids.numel() < self.cf5_min_history:
+#                 continue
+
+#             self.cf5_stats['target_eligible'] += 1
+
+#             history_rep = item_rep[history_item_ids]
+#             history_mask = mask_weights[history_edge_tensor]
+
+#             pos_score, pos_weight_shift, pos_similarity = (
+#                 self._target_conditioned_residual_score(
+#                     history_rep,
+#                     item_rep[pos_item],
+#                     history_mask
+#                 )
+#             )
+
+#             neg_score, neg_weight_shift, neg_similarity = (
+#                 self._target_conditioned_residual_score(
+#                     history_rep,
+#                     item_rep[neg_item],
+#                     history_mask
+#                 )
+#             )
+
+#             residual_gap = pos_score - neg_score
+
+#             user_loss = F.softplus(
+#                 (
+#                     neg_score - pos_score
+#                 )
+#                 / self.cf5_target_loss_temperature
+#             )
+
+#             losses.append(user_loss)
+
+#             with torch.no_grad():
+#                 self.cf5_stats['target_used'] += 1
+#                 self.cf5_stats['target_loss_sum'] += float(
+#                     user_loss.detach().cpu()
+#                 )
+#                 self.cf5_stats['target_pos_residual_sum'] += float(
+#                     pos_score.detach().cpu()
+#                 )
+#                 self.cf5_stats['target_neg_residual_sum'] += float(
+#                     neg_score.detach().cpu()
+#                 )
+#                 self.cf5_stats['target_residual_gap_sum'] += float(
+#                     residual_gap.detach().cpu()
+#                 )
+#                 self.cf5_stats['target_weight_shift_sum'] += float(
+#                     (
+#                         0.5 * (pos_weight_shift + neg_weight_shift)
+#                     ).detach().cpu()
+#                 )
+#                 self.cf5_stats['target_pos_similarity_sum'] += float(
+#                     pos_similarity.detach().cpu()
+#                 )
+#                 self.cf5_stats['target_neg_similarity_sum'] += float(
+#                     neg_similarity.detach().cpu()
+#                 )
+
+#         if not losses:
+#             return reference_loss * 0.0
+
+#         return torch.stack(losses).mean()
+
+#     def target_residual_for_pairs(self, user_ids, item_ids):
+#         """Vectorized R(u,p) for arbitrary user-item pairs.
+
+#         Uses already-computed masked embeddings; no GCN rerun and no pair loop.
+#         """
+#         user_ids = user_ids.view(-1).long()
+#         item_ids = item_ids.view(-1).long()
+
+#         if user_ids.numel() != item_ids.numel():
+#             raise ValueError('user_ids and item_ids must have equal length.')
+
+#         if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+#             raise RuntimeError(
+#                 'mask_rep is unavailable. Run the base embedding/forward path '
+#                 'before calling target_residual_for_pairs().'
+#             )
+
+#         item_rep = self.mask_rep[self.num_user:]
+
+#         edge_ids, history_item_ids, history_valid = (
+#             self._gather_vectorized_batch_history(
+#                 user_ids,
+#                 item_ids,
+#                 negatives=None
+#             )
+#         )
+
+#         if history_item_ids.size(1) == 0:
+#             return item_rep[item_ids].sum(dim=1) * 0.0
+
+#         history_count = history_valid.sum(dim=1)
+#         valid_rows = history_count >= self.cf5_min_history
+
+#         history_rep = item_rep[history_item_ids]
+#         target_rep = item_rep[item_ids]
+#         history_mask = self.get_forward_edge_mask()[edge_ids]
+
+#         eps = self.cf5_target_mask_eps
+#         detached_mask = history_mask.detach().clamp_min(eps)
+
+#         safe_valid = history_valid.clone()
+#         has_any = safe_valid.any(dim=1)
+#         if (~has_any).any():
+#             safe_valid[~has_any, 0] = True
+
+#         neg_large = torch.finfo(history_rep.dtype).min
+
+#         base_logits = torch.log(detached_mask).masked_fill(
+#             ~safe_valid,
+#             neg_large
+#         )
+#         base_weight = torch.softmax(base_logits, dim=1)
+
+#         similarity = torch.sum(
+#             F.normalize(history_rep, dim=2)
+#             * F.normalize(target_rep, dim=1).unsqueeze(1),
+#             dim=2
+#         )
+
+#         target_logits = (
+#             base_logits
+#             + (
+#                 self.cf5_target_gamma
+#                 / self.cf5_target_temperature
+#             ) * similarity
+#         ).masked_fill(~safe_valid, neg_large)
+
+#         target_weight = torch.softmax(
+#             target_logits,
+#             dim=1
+#         )
+
+#         global_history = torch.bmm(
+#             base_weight.unsqueeze(1),
+#             history_rep
+#         ).squeeze(1)
+
+#         target_history = torch.bmm(
+#             target_weight.unsqueeze(1),
+#             history_rep
+#         ).squeeze(1)
+
+#         residual = torch.sum(
+#             (target_history - global_history) * target_rep,
+#             dim=1
+#         )
+
+#         zero = target_rep.sum(dim=1) * 0.0
+#         return torch.where(valid_rows, residual, zero)
+
+#     def target_residual_for_all_items(self, user_id):
+#         """Compute R(u,p) for every catalog item for one user, chunked.
+
+#         This helper is intended for wiring the same correction into a
+#         full-sort evaluator once the base MASKED_GLORIA full_sort_predict
+#         signature is known. It uses the already-computed masked embeddings and
+#         does not rerun GCN per candidate.
+#         """
+#         if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+#             raise RuntimeError(
+#                 'mask_rep is unavailable. Run the base embedding path first.'
+#             )
+
+#         user_id = int(user_id)
+#         item_rep = self.mask_rep[self.num_user:]
+#         num_items = int(item_rep.size(0))
+#         edge_ids = self.user_to_edge_ids[user_id]
+
+#         if len(edge_ids) < self.cf5_min_history:
+#             return torch.zeros(
+#                 num_items,
+#                 dtype=item_rep.dtype,
+#                 device=item_rep.device
+#             )
+
+#         edge_tensor = torch.tensor(
+#             edge_ids,
+#             dtype=torch.long,
+#             device=self.forward_edge_users.device
+#         )
+#         history_item_ids = self.forward_edge_items[edge_tensor]
+#         history_rep = item_rep[history_item_ids]
+#         history_mask = self.get_forward_edge_mask()[edge_tensor]
+
+#         eps = self.cf5_target_mask_eps
+#         base_mask = history_mask.detach().clamp_min(eps)
+#         base_logits = torch.log(base_mask)
+#         base_weight = torch.softmax(base_logits, dim=0)
+#         global_history = torch.sum(
+#             base_weight.unsqueeze(-1) * history_rep,
+#             dim=0
+#         )
+
+#         history_norm = F.normalize(history_rep, dim=1)
+#         residual_chunks = []
+#         chunk_size = self.cf5_target_full_sort_chunk_size
+
+#         for start in range(0, num_items, chunk_size):
+#             end = min(start + chunk_size, num_items)
+#             candidates = item_rep[start:end]
+#             candidate_norm = F.normalize(candidates, dim=1)
+
+#             # [history_len, chunk]
+#             similarity = torch.matmul(
+#                 history_norm,
+#                 candidate_norm.transpose(0, 1)
+#             )
+#             logits = (
+#                 base_logits.unsqueeze(1)
+#                 + self.cf5_target_gamma
+#                 * similarity
+#                 / self.cf5_target_temperature
+#             )
+#             weights = torch.softmax(logits, dim=0)
+
+#             # [chunk, dim]
+#             target_history = torch.matmul(
+#                 weights.transpose(0, 1),
+#                 history_rep
+#             )
+#             residual_rep = target_history - global_history.unsqueeze(0)
+#             residual_score = torch.sum(
+#                 residual_rep * candidates,
+#                 dim=1
+#             )
+#             residual_chunks.append(residual_score)
+
+#         return torch.cat(residual_chunks, dim=0)
+
+
+# coding: utf-8
+
 import itertools
 import math
 import random
@@ -2691,7 +4028,8 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         ablation, but defaults to zero in this version.
 
     The direct target-residual scorer is fully vectorized over each
-    training mini-batch.
+    training mini-batch. Pairwise and full-sort inference use the SAME
+    s_base + eta * R scoring rule after the same score warmup.
 
     This version intentionally contains NO counterfactual loss.
     """
@@ -2765,6 +4103,12 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         )
         self.cf5_target_full_sort_chunk_size = int(
             _cfg(config, 'cf5_target_full_sort_chunk_size', 2048)
+        )
+        # Number of users processed together when computing full-sort target
+        # corrections. Keeping this modest bounds the [B, H, item_chunk]
+        # attention tensor used during evaluation.
+        self.cf5_target_full_sort_user_chunk_size = int(
+            _cfg(config, 'cf5_target_full_sort_user_chunk_size', 16)
         )
 
         # 0 keeps the full graph history (same semantics as the old scorer).
@@ -2846,6 +4190,10 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         if self.cf5_target_full_sort_chunk_size <= 0:
             raise ValueError(
                 'cf5_target_full_sort_chunk_size must be positive.'
+            )
+        if self.cf5_target_full_sort_user_chunk_size <= 0:
+            raise ValueError(
+                'cf5_target_full_sort_user_chunk_size must be positive.'
             )
         if self.cf5_target_vectorized_max_history < 0:
             raise ValueError(
@@ -3261,6 +4609,13 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         return (
             self.training
             and self.cf5_target_score_eta > 0.0
+            and self.current_epoch >= self.cf5_target_score_warmup_epochs
+        )
+
+    def _target_score_active_for_inference(self):
+        """Use the exact same correction after the same score warmup."""
+        return (
+            self.cf5_target_score_eta > 0.0
             and self.current_epoch >= self.cf5_target_score_warmup_epochs
         )
 
@@ -3878,6 +5233,254 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         zero = target_rep.sum(dim=1) * 0.0
         return torch.where(valid_rows, residual, zero)
 
+    def _require_mask_rep_for_inference(self):
+        """Fail loudly if the base scorer did not expose masked embeddings.
+
+        predict()/full_sort_predict() first call the original MASKED_GLORIA
+        implementation through super(). That base path is expected to compute
+        the same branch embeddings used for its recommendation score. The
+        target correction must use those SAME current embeddings; silently
+        falling back to a stale training-time mask_rep would make evaluation
+        inconsistent again.
+        """
+        if not hasattr(self, 'mask_rep') or self.mask_rep is None:
+            raise RuntimeError(
+                'MASKED_GLORIA inference did not populate self.mask_rep. '
+                'The target correction cannot be evaluated safely from stale '
+                'embeddings. Please expose the current masked-branch embedding '
+                'inside the base predict/full_sort_predict path.'
+            )
+
+    def target_residual_for_full_sort_batch(self, user_ids):
+        """Compute R(u,p) for all catalog items for a batch of users.
+
+        This is vectorized over BOTH users and candidate items, with two chunk
+        dimensions to control memory:
+            cf5_target_full_sort_user_chunk_size
+            cf5_target_full_sort_chunk_size
+
+        No GCN is rerun per candidate. The method only reuses current
+        self.mask_rep and computes target-conditioned history readouts.
+        """
+        self._require_mask_rep_for_inference()
+
+        user_ids = user_ids.view(-1).long()
+        item_rep = self.mask_rep[self.num_user:]
+        num_items = int(item_rep.size(0))
+        num_users = int(user_ids.numel())
+
+        if num_users == 0:
+            return torch.empty(
+                (0, num_items),
+                dtype=item_rep.dtype,
+                device=item_rep.device
+            )
+
+        eps = self.cf5_target_mask_eps
+        scale = (
+            self.cf5_target_gamma
+            / self.cf5_target_temperature
+        )
+        item_chunk = self.cf5_target_full_sort_chunk_size
+        user_chunk = self.cf5_target_full_sort_user_chunk_size
+
+        all_user_chunks = []
+
+        # We still chunk users to bound memory, but there is no per-user
+        # target-scoring loop inside a chunk.
+        for user_start in range(0, num_users, user_chunk):
+            user_end = min(user_start + user_chunk, num_users)
+            users = user_ids[user_start:user_end]
+            current_b = int(users.numel())
+
+            counts = self.cf5_history_counts[users]
+            starts = self.cf5_history_offsets[users]
+
+            max_history_cfg = self.cf5_target_vectorized_max_history
+            if max_history_cfg > 0:
+                lengths = counts.clamp(max=max_history_cfg)
+                starts = starts + (counts - lengths)
+            else:
+                lengths = counts
+
+            batch_max_history = int(lengths.max().detach().item())
+
+            if batch_max_history == 0:
+                all_user_chunks.append(torch.zeros(
+                    (current_b, num_items),
+                    dtype=item_rep.dtype,
+                    device=item_rep.device
+                ))
+                continue
+
+            rel = torch.arange(
+                batch_max_history,
+                dtype=torch.long,
+                device=user_ids.device
+            ).unsqueeze(0)
+
+            history_valid = rel < lengths.unsqueeze(1)
+            sorted_positions = starts.unsqueeze(1) + rel
+            sorted_positions = sorted_positions.clamp(
+                max=self.cf5_history_sorted_edge_ids.numel() - 1
+            )
+
+            edge_ids = self.cf5_history_sorted_edge_ids[sorted_positions]
+            history_item_ids = self.forward_edge_items[edge_ids]
+            history_rep = item_rep[history_item_ids]  # [B,H,D]
+            history_mask = self.get_forward_edge_mask()[edge_ids]
+
+            valid_rows = (
+                history_valid.sum(dim=1) >= self.cf5_min_history
+            )
+
+            safe_valid = history_valid.clone()
+            has_any = safe_valid.any(dim=1)
+            if (~has_any).any():
+                safe_valid[~has_any, 0] = True
+
+            neg_large = torch.finfo(item_rep.dtype).min
+            base_logits = torch.log(
+                history_mask.detach().clamp_min(eps)
+            ).masked_fill(~safe_valid, neg_large)
+
+            base_weight = torch.softmax(base_logits, dim=1)
+            global_history = torch.bmm(
+                base_weight.unsqueeze(1),
+                history_rep
+            ).squeeze(1)  # [B,D]
+
+            history_norm = F.normalize(history_rep, dim=2)
+            item_score_chunks = []
+
+            for item_start in range(0, num_items, item_chunk):
+                item_end = min(item_start + item_chunk, num_items)
+                candidates = item_rep[item_start:item_end]  # [C,D]
+                candidate_norm = F.normalize(candidates, dim=1)
+
+                # [B,H,C]
+                similarity = torch.einsum(
+                    'bhd,cd->bhc',
+                    history_norm,
+                    candidate_norm
+                )
+
+                logits = (
+                    base_logits.unsqueeze(2)
+                    + scale * similarity
+                )
+                logits = logits.masked_fill(
+                    ~safe_valid.unsqueeze(2),
+                    neg_large
+                )
+
+                # [B,H,C]
+                target_weight = torch.softmax(logits, dim=1)
+
+                # [B,C,D]
+                target_history = torch.einsum(
+                    'bhc,bhd->bcd',
+                    target_weight,
+                    history_rep
+                )
+
+                residual_rep = (
+                    target_history - global_history.unsqueeze(1)
+                )
+
+                # [B,C]
+                residual_score = torch.sum(
+                    residual_rep * candidates.unsqueeze(0),
+                    dim=2
+                )
+
+                # Users with too-short history exactly fall back to base score.
+                residual_score = torch.where(
+                    valid_rows.unsqueeze(1),
+                    residual_score,
+                    torch.zeros_like(residual_score)
+                )
+
+                item_score_chunks.append(residual_score)
+
+            all_user_chunks.append(
+                torch.cat(item_score_chunks, dim=1)
+            )
+
+        return torch.cat(all_user_chunks, dim=0)
+
+    def predict(self, interaction):
+        """Pairwise inference with the SAME scorer used in training.
+
+            s_eval(u,p) = s_base(u,p) + eta * R(u,p)
+
+        Before score warmup, this exactly returns the original base score.
+        """
+        base_scores = super(MASKED_GLORIA_cf5, self).predict(interaction)
+
+        if not self._target_score_active_for_inference():
+            return base_scores
+
+        self._require_mask_rep_for_inference()
+
+        users = interaction[0].view(-1)
+        items = interaction[1].view(-1)
+
+        with torch.no_grad():
+            residual = self.target_residual_for_pairs(users, items)
+
+        corrected = (
+            base_scores.view(-1)
+            + self.cf5_target_score_eta * residual.view(-1)
+        )
+        return corrected.reshape_as(base_scores)
+
+    def full_sort_predict(self, interaction):
+        """Full-sort inference consistent with direct residual training.
+
+        The original MASKED_GLORIA computes the base all-item scores first.
+        We then add the target residual for every candidate:
+
+            S_eval = S_base + eta * R_all
+
+        The returned shape is preserved exactly as the base implementation
+        (flattened or [B, num_items]).
+        """
+        base_scores = super(
+            MASKED_GLORIA_cf5,
+            self
+        ).full_sort_predict(interaction)
+
+        if not self._target_score_active_for_inference():
+            return base_scores
+
+        self._require_mask_rep_for_inference()
+        users = interaction[0].view(-1)
+        num_users = int(users.numel())
+        num_items = int(self.mask_rep.size(0) - self.num_user)
+
+        expected = num_users * num_items
+        if int(base_scores.numel()) != expected:
+            raise RuntimeError(
+                'Unexpected base full_sort_predict shape: got {} scores for '
+                '{} users x {} items (expected {}).'.format(
+                    int(base_scores.numel()),
+                    num_users,
+                    num_items,
+                    expected
+                )
+            )
+
+        with torch.no_grad():
+            residual_all = self.target_residual_for_full_sort_batch(users)
+
+        corrected_2d = (
+            base_scores.reshape(num_users, num_items)
+            + self.cf5_target_score_eta * residual_all
+        )
+
+        return corrected_2d.reshape_as(base_scores)
+
     def target_residual_for_all_items(self, user_id):
         """Compute R(u,p) for every catalog item for one user, chunked.
 
@@ -3956,3 +5559,4 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
             residual_chunks.append(residual_score)
 
         return torch.cat(residual_chunks, dim=0)
+
