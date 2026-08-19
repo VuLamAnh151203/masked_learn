@@ -77,7 +77,7 @@ class MASKED_GLORIA_CF4(MASKED_GLORIA):
         #   cf4_repr_mode: pairwise
         # -------------------------------------------------------------
         self.cf4_repr_lambda = float(
-            _cfg(config, 'cf4_repr_lambda', 0.01)
+            _cfg(config, 'cf4_repr_lambda', 0.005)
         )
         self.cf4_repr_mode = str(
             _cfg(config, 'cf4_repr_mode', 'mse')
