@@ -77,10 +77,10 @@ class MASKED_GLORIA_CF4(MASKED_GLORIA):
         #   cf4_repr_mode: pairwise
         # -------------------------------------------------------------
         self.cf4_repr_lambda = float(
-            _cfg(config, 'cf4_repr_lambda', 0.005)
+            _cfg(config, 'cf4_repr_lambda', 0.01)
         )
         self.cf4_repr_mode = str(
-            _cfg(config, 'cf4_repr_mode', 'mse')
+            _cfg(config, 'cf4_repr_mode', 'pairwise')
         ).strip().lower()
         self.cf4_repr_temperature = float(
             _cfg(config, 'cf4_repr_temperature', 1.0)
