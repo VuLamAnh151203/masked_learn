@@ -5416,7 +5416,7 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
 
         Before score warmup, this exactly returns the original base score.
         """
-        base_scores = super(MASKED_GLORIA_cf5, self).predict(interaction)
+        base_scores = super(MASKED_GLORIA_CF5, self).predict(interaction)
 
         if not self._target_score_active_for_inference():
             return base_scores
@@ -5447,7 +5447,7 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         (flattened or [B, num_items]).
         """
         base_scores = super(
-            MASKED_GLORIA_cf5,
+            MASKED_GLORIA_CF5,
             self
         ).full_sort_predict(interaction)
 
