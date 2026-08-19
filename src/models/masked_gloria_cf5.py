@@ -1,3 +1,5 @@
+# coding: utf-8
+
 import itertools
 import math
 import random
@@ -24,21 +26,21 @@ def _cfg_bool(config, key, default):
 
 
 class MASKED_GLORIA_CF5(MASKED_GLORIA):
-    """MASKED_GLORIA with broad mask regularization + representation distillation.
+    """MASKED_GLORIA with broad mask loss + target-aware counterfactual loss.
 
     Broad loss:
-        history item -> similarity to the user's masked-history prototype
-        -> pairwise ordering of edge-mask weights.
+        preserve the existing history-prototype-guided ordering of edge masks.
 
-    Finding-2 representation loss:
-        the full-graph branch acts as a teacher and defines target-specific
-        item-item similarity. The masked branch is trained to preserve that
-        relative similarity structure.
+    Counterfactual loss:
+        for each sampled (user, positive, negative) training triple, construct
+        a factual target-aware history readout and a counterfactual readout.
+        Both use the same history and the same static mask prior; only the
+        target-specific relevance is intervened from q(e,p) to -q(e,p).
 
-    No hard-negative loss and no explicit counterfactual edge drop are used.
+        The loss encourages the factual-vs-counterfactual effect to be larger
+        for the positive target than for the negative target.
 
-    Pairwise losses are vectorized across sampled pairs to reduce Python
-    overhead and repeated GPU-to-CPU synchronization.
+    No graph-edge dropping and no full-branch teacher are required.
     """
 
     def __init__(self, config, dataset):
@@ -66,43 +68,34 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         )
         self.cf5_log_stats = _cfg_bool(config, 'cf5_log_stats', True)
 
-        # -------------------------------------------------------------
-        # Finding-2 representation distillation.
-        #
-        # V1 default:
-        #   teacher similarity = cos(z_e^full, z_p^full)
-        #   student similarity = cos(z_e^mask, z_p^mask)
-        #   L_repr = MSE(student_similarity, stopgrad(teacher_similarity))
-        #
-        # A pairwise/ranking version is also available by setting:
-        #   cf5_repr_mode: pairwise
-        # -------------------------------------------------------------
-        self.cf5_repr_lambda = float(
-            _cfg(config, 'cf5_repr_lambda', 0.01)
+        # Target-aware counterfactual readout.
+        self.cf5_cf_lambda = float(
+            _cfg(config, 'cf5_cf_lambda', 0.005)
         )
-        self.cf5_repr_mode = str(
-            _cfg(config, 'cf5_repr_mode', 'pairwise')
-        ).strip().lower()
-        self.cf5_repr_temperature = float(
-            _cfg(config, 'cf5_repr_temperature', 1.0)
+        self.cf5_target_temperature = float(
+            _cfg(config, 'cf5_target_temperature', 1.0)
         )
-        self.cf5_repr_pair_count = int(
-            _cfg(config, 'cf5_repr_pair_count', 16)
+        self.cf5_cf_temperature = float(
+            _cfg(config, 'cf5_cf_temperature', 1.0)
         )
-        self.cf5_repr_user_ratio = float(
-            _cfg(config, 'cf5_repr_user_ratio', self.cf5_user_ratio)
+        self.cf5_cf_margin = float(
+            _cfg(config, 'cf5_cf_margin', 0.0)
         )
-        self.cf5_repr_batch_size = int(
-            _cfg(config, 'cf5_repr_batch_size', self.cf5_batch_size)
+        self.cf5_cf_user_ratio = float(
+            _cfg(config, 'cf5_cf_user_ratio', self.cf5_user_ratio)
         )
-
-        # If the base class exposes a full-branch tensor directly, put its
-        # attribute name here. If absent, the code will try to infer the full
-        # branch from result_embed when result_embed is a concat of
-        # [full_branch, mask_branch] (or the reverse order).
-        self.cf5_teacher_attr = str(
-            _cfg(config, 'cf5_teacher_attr', 'full_rep')
-        ).strip()
+        self.cf5_cf_batch_size = int(
+            _cfg(config, 'cf5_cf_batch_size', self.cf5_batch_size)
+        )
+        self.cf5_cf_use_mask_prior = _cfg_bool(
+            config, 'cf5_cf_use_mask_prior', True
+        )
+        self.cf5_cf_detach_mask_prior = _cfg_bool(
+            config, 'cf5_cf_detach_mask_prior', True
+        )
+        self.cf5_cf_mask_eps = float(
+            _cfg(config, 'cf5_cf_mask_eps', 1e-8)
+        )
 
         max_epochs = int(_cfg(config, 'epochs', 1000))
         if configured_warmup_epochs >= 0:
@@ -135,21 +128,20 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
             raise ValueError('cf5_similarity_eps must be non-negative.')
         if self.cf5_warmup_epochs < 0:
             raise ValueError('cf5_warmup_epochs must be non-negative.')
-
-        if self.cf5_repr_lambda < 0.0:
-            raise ValueError('cf5_repr_lambda must be non-negative.')
-        if self.cf5_repr_mode not in ('mse', 'pairwise'):
-            raise ValueError(
-                "cf5_repr_mode must be either 'mse' or 'pairwise'."
-            )
-        if self.cf5_repr_temperature <= 0.0:
-            raise ValueError('cf5_repr_temperature must be positive.')
-        if self.cf5_repr_pair_count <= 0:
-            raise ValueError('cf5_repr_pair_count must be positive.')
-        if not 0.0 <= self.cf5_repr_user_ratio <= 1.0:
-            raise ValueError('cf5_repr_user_ratio must be in [0, 1].')
-        if self.cf5_repr_batch_size <= 0:
-            raise ValueError('cf5_repr_batch_size must be positive.')
+        if self.cf5_cf_lambda < 0.0:
+            raise ValueError('cf5_cf_lambda must be non-negative.')
+        if self.cf5_target_temperature <= 0.0:
+            raise ValueError('cf5_target_temperature must be positive.')
+        if self.cf5_cf_temperature <= 0.0:
+            raise ValueError('cf5_cf_temperature must be positive.')
+        if self.cf5_cf_margin < 0.0:
+            raise ValueError('cf5_cf_margin must be non-negative.')
+        if not 0.0 <= self.cf5_cf_user_ratio <= 1.0:
+            raise ValueError('cf5_cf_user_ratio must be in [0, 1].')
+        if self.cf5_cf_batch_size <= 0:
+            raise ValueError('cf5_cf_batch_size must be positive.')
+        if self.cf5_cf_mask_eps <= 0.0:
+            raise ValueError('cf5_cf_mask_eps must be positive.')
 
     def _build_cf5_history(self):
         user_to_edge_ids = [[] for _ in range(self.num_user)]
@@ -161,23 +153,23 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
     @staticmethod
     def _new_cf5_stats():
         return {
-            # Broad mask-relation stats.
             'samples': 0,
             'eligible': 0,
             'pairs': 0,
             'used': 0,
             'loss_sum': 0.0,
             'similarity_gap_sum': 0.0,
-
-            # Finding-2 representation stats.
-            'repr_samples': 0,
-            'repr_eligible': 0,
-            'repr_used': 0,
-            'repr_loss_sum': 0.0,
-            'repr_teacher_sim_sum': 0.0,
-            'repr_student_sim_sum': 0.0,
-            'repr_abs_error_sum': 0.0,
-            'repr_teacher_missing': 0,
+            'cf_samples': 0,
+            'cf_eligible': 0,
+            'cf_used': 0,
+            'cf_loss_sum': 0.0,
+            'cf_pos_effect_sum': 0.0,
+            'cf_neg_effect_sum': 0.0,
+            'cf_effect_gap_sum': 0.0,
+            'cf_pos_fact_sum': 0.0,
+            'cf_pos_counter_sum': 0.0,
+            'cf_neg_fact_sum': 0.0,
+            'cf_neg_counter_sum': 0.0,
         }
 
     def set_training_epoch(self, epoch_idx):
@@ -195,28 +187,29 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
             return None
 
         used = max(self.cf5_stats['used'], 1)
-        repr_used = max(self.cf5_stats['repr_used'], 1)
-
+        cf_used = max(self.cf5_stats['cf_used'], 1)
         return (
-            'broad-mask + representation-distillation: epoch={epoch}, '
-            'warmup_epochs={warmup}, '
+            'broad-mask + target-aware counterfactual: '
+            'epoch={epoch}, warmup_epochs={warmup}, '
             'broad_lambda={lambda_cf5:.6f}, '
             'broad_temperature={temperature:.6f}, '
             'broad_samples={samples}, broad_eligible={eligible}, '
             'broad_pairs={pairs}, broad_used={used_count}, '
             'broad_loss={loss:.6f}, broad_similarity_gap={gap:.6f}, '
-            'repr_lambda={repr_lambda:.6f}, repr_mode={repr_mode}, '
-            'repr_temperature={repr_temperature:.6f}, '
-            'repr_samples={repr_samples}, repr_eligible={repr_eligible}, '
-            'repr_used={repr_used_count}, repr_loss={repr_loss:.6f}, '
-            'teacher_sim={teacher_sim:.6f}, '
-            'student_sim={student_sim:.6f}, '
-            'repr_abs_error={repr_error:.6f}, '
-            'teacher_missing={teacher_missing}'
+            'cf_lambda={cf_lambda:.6f}, '
+            'target_temperature={target_temperature:.6f}, '
+            'cf_temperature={cf_temperature:.6f}, '
+            'cf_margin={cf_margin:.6f}, '
+            'cf_samples={cf_samples}, cf_eligible={cf_eligible}, '
+            'cf_used={cf_used_count}, cf_loss={cf_loss:.6f}, '
+            'cf_pos_effect={cf_pos_effect:.6f}, '
+            'cf_neg_effect={cf_neg_effect:.6f}, '
+            'cf_effect_gap={cf_effect_gap:.6f}, '
+            'pos_fact={pos_fact:.6f}, pos_counter={pos_counter:.6f}, '
+            'neg_fact={neg_fact:.6f}, neg_counter={neg_counter:.6f}'
         ).format(
             epoch=int(self.current_epoch),
             warmup=int(self.cf5_warmup_epochs),
-
             lambda_cf5=float(self.cf5_lambda),
             temperature=float(self.cf5_temperature),
             samples=int(self.cf5_stats['samples']),
@@ -225,39 +218,28 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
             used_count=int(self.cf5_stats['used']),
             loss=float(self.cf5_stats['loss_sum'] / used),
             gap=float(self.cf5_stats['similarity_gap_sum'] / used),
-
-            repr_lambda=float(self.cf5_repr_lambda),
-            repr_mode=str(self.cf5_repr_mode),
-            repr_temperature=float(self.cf5_repr_temperature),
-            repr_samples=int(self.cf5_stats['repr_samples']),
-            repr_eligible=int(self.cf5_stats['repr_eligible']),
-            repr_used_count=int(self.cf5_stats['repr_used']),
-            repr_loss=float(
-                self.cf5_stats['repr_loss_sum'] / repr_used
-            ),
-            teacher_sim=float(
-                self.cf5_stats['repr_teacher_sim_sum'] / repr_used
-            ),
-            student_sim=float(
-                self.cf5_stats['repr_student_sim_sum'] / repr_used
-            ),
-            repr_error=float(
-                self.cf5_stats['repr_abs_error_sum'] / repr_used
-            ),
-            teacher_missing=int(self.cf5_stats['repr_teacher_missing']),
+            cf_lambda=float(self.cf5_cf_lambda),
+            target_temperature=float(self.cf5_target_temperature),
+            cf_temperature=float(self.cf5_cf_temperature),
+            cf_margin=float(self.cf5_cf_margin),
+            cf_samples=int(self.cf5_stats['cf_samples']),
+            cf_eligible=int(self.cf5_stats['cf_eligible']),
+            cf_used_count=int(self.cf5_stats['cf_used']),
+            cf_loss=float(self.cf5_stats['cf_loss_sum'] / cf_used),
+            cf_pos_effect=float(self.cf5_stats['cf_pos_effect_sum'] / cf_used),
+            cf_neg_effect=float(self.cf5_stats['cf_neg_effect_sum'] / cf_used),
+            cf_effect_gap=float(self.cf5_stats['cf_effect_gap_sum'] / cf_used),
+            pos_fact=float(self.cf5_stats['cf_pos_fact_sum'] / cf_used),
+            pos_counter=float(self.cf5_stats['cf_pos_counter_sum'] / cf_used),
+            neg_fact=float(self.cf5_stats['cf_neg_fact_sum'] / cf_used),
+            neg_counter=float(self.cf5_stats['cf_neg_counter_sum'] / cf_used),
         )
 
     def _is_cf5_active(self):
         return (
             self.training
-            and (
-                self.cf5_lambda > 0.0
-                or self.cf5_repr_lambda > 0.0
-            )
-            and (
-                self.cf5_user_ratio > 0.0
-                or self.cf5_repr_user_ratio > 0.0
-            )
+            and (self.cf5_lambda > 0.0 or self.cf5_cf_lambda > 0.0)
+            and (self.cf5_user_ratio > 0.0 or self.cf5_cf_user_ratio > 0.0)
             and self.current_epoch >= self.cf5_warmup_epochs
         )
 
@@ -281,22 +263,19 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         else:
             loss_mask_relation = loss_rec * 0.0
 
-        if self.cf5_repr_lambda > 0.0:
-            loss_repr = self._calculate_representation_loss(
+        if self.cf5_cf_lambda > 0.0:
+            loss_counterfactual = self._calculate_counterfactual_loss(
                 interaction,
                 loss_rec
             )
         else:
-            loss_repr = loss_rec * 0.0
+            loss_counterfactual = loss_rec * 0.0
 
         weighted_auxiliary = (
             self.cf5_lambda * loss_mask_relation
-            + self.cf5_repr_lambda * loss_repr
+            + self.cf5_cf_lambda * loss_counterfactual
         )
-
         self.result_embed = None
-
-        # Preserve the old trainer API.
         return loss_rec, weighted_auxiliary
 
     def _sample_cf5_users(self, interaction):
@@ -313,17 +292,13 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         sample_count = min(sample_count, self.cf5_batch_size, len(users))
         return self._cf5_rng.sample(users, sample_count)
 
-    def _sample_cf5_pairs(self, history_size, pair_count=None):
-        if pair_count is None:
-            pair_count = self.cf5_pair_count
-        pair_count = int(pair_count)
-
+    def _sample_cf5_pairs(self, history_size):
         total_pairs = history_size * (history_size - 1) // 2
-        if total_pairs <= pair_count:
+        if total_pairs <= self.cf5_pair_count:
             return list(itertools.combinations(range(history_size), 2))
 
         pairs = set()
-        while len(pairs) < pair_count:
+        while len(pairs) < self.cf5_pair_count:
             left = self._cf5_rng.randrange(history_size)
             right = self._cf5_rng.randrange(history_size)
             if left == right:
@@ -365,65 +340,39 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
             ).detach()
 
             pair_positions = self._sample_cf5_pairs(len(edge_ids))
-            if not pair_positions:
-                continue
 
-            # Vectorized broad pairwise loss: all sampled pairs for this user
-            # are processed in one GPU operation.
-            pair_tensor = torch.as_tensor(
-                pair_positions,
-                dtype=torch.long,
-                device=relevance.device
-            )
-            left_pos = pair_tensor[:, 0]
-            right_pos = pair_tensor[:, 1]
+            for left_pos, right_pos in pair_positions:
+                relevance_gap = (
+                    relevance[left_pos] - relevance[right_pos]
+                )
+                if abs(float(relevance_gap.detach().cpu())) <= self.cf5_similarity_eps:
+                    continue
 
-            relevance_gap = relevance[left_pos] - relevance[right_pos]
-            valid = relevance_gap.abs() > self.cf5_similarity_eps
-            if not torch.any(valid):
-                continue
+                left_edge = int(edge_ids[left_pos])
+                right_edge = int(edge_ids[right_pos])
+                mask_gap = mask_weights[left_edge] - mask_weights[right_edge]
+                direction = torch.sign(relevance_gap)
+                pair_loss = F.softplus(
+                    -self.cf5_temperature * direction * mask_gap
+                )
+                losses.append(pair_loss)
 
-            left_pos = left_pos[valid]
-            right_pos = right_pos[valid]
-            relevance_gap = relevance_gap[valid]
-
-            edge_id_tensor = torch.as_tensor(
-                edge_ids,
-                dtype=torch.long,
-                device=mask_weights.device
-            )
-            left_edges = edge_id_tensor[left_pos]
-            right_edges = edge_id_tensor[right_pos]
-
-            mask_gap = mask_weights[left_edges] - mask_weights[right_edges]
-            direction = torch.sign(relevance_gap)
-            pair_losses = F.softplus(
-                -self.cf5_temperature * direction * mask_gap
-            )
-
-            # Store one vector per user. torch.cat(...).mean() below preserves
-            # the original mean over ALL valid broad pairs.
-            losses.append(pair_losses)
-
-            # Only two GPU->CPU synchronizations per user instead of two per pair.
-            with torch.no_grad():
-                pair_count = int(pair_losses.numel())
-                broad_stat_values = torch.stack([
-                    pair_losses.sum().detach(),
-                    relevance_gap.abs().sum().detach(),
-                ]).cpu().tolist()
-
-                self.cf5_stats['pairs'] += pair_count
-                self.cf5_stats['used'] += pair_count
-                self.cf5_stats['loss_sum'] += broad_stat_values[0]
-                self.cf5_stats['similarity_gap_sum'] += broad_stat_values[1]
+                with torch.no_grad():
+                    self.cf5_stats['pairs'] += 1
+                    self.cf5_stats['used'] += 1
+                    self.cf5_stats['loss_sum'] += float(
+                        pair_loss.detach().cpu()
+                    )
+                    self.cf5_stats['similarity_gap_sum'] += float(
+                        relevance_gap.abs().detach().cpu()
+                    )
 
         if not losses:
             return reference_loss * 0.0
-        return torch.cat(losses, dim=0).mean()
+        return torch.stack(losses).mean()
 
-    def _sample_repr_users(self, interaction):
-        """Sample users for Finding-2 representation supervision."""
+    def _sample_cf_users(self, interaction):
+        """Sample users for target-aware counterfactual supervision."""
         if interaction is None or len(interaction) == 0:
             return []
 
@@ -432,177 +381,132 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
         if not users:
             return []
 
-        sample_count = int(
-            math.ceil(len(users) * self.cf5_repr_user_ratio)
-        )
+        sample_count = int(math.ceil(len(users) * self.cf5_cf_user_ratio))
         sample_count = max(1, sample_count)
-        sample_count = min(
-            sample_count,
-            self.cf5_repr_batch_size,
-            len(users)
-        )
+        sample_count = min(sample_count, self.cf5_cf_batch_size, len(users))
         return self._cf5_rng.sample(users, sample_count)
 
     @staticmethod
-    def _build_batch_positive_targets(interaction):
-        """Map each mini-batch user to positive target item ids.
+    def _build_batch_pos_neg_targets(interaction):
+        """Map each user to its (positive, negative) pairs in the batch.
 
-        The existing code already implies:
+        Assumes the standard triplet layout:
             interaction[0] -> user ids
             interaction[1] -> positive item ids
+            interaction[2] -> negative item ids
         """
-        if interaction is None or len(interaction) < 2:
+        if interaction is None or len(interaction) < 3:
             return {}
 
         users = interaction[0].detach().view(-1).cpu().tolist()
         positives = interaction[1].detach().view(-1).cpu().tolist()
+        negatives = interaction[2].detach().view(-1).cpu().tolist()
 
-        if len(users) != len(positives):
+        if not (len(users) == len(positives) == len(negatives)):
             return {}
 
         mapping = {}
-        for user_id, item_id in zip(users, positives):
-            mapping.setdefault(int(user_id), []).append(int(item_id))
+        for user_id, pos_item, neg_item in zip(users, positives, negatives):
+            mapping.setdefault(int(user_id), []).append(
+                (int(pos_item), int(neg_item))
+            )
         return mapping
 
-    def _get_full_teacher_representation(self):
-        """Return the full-graph node representation used as teacher.
+    def _target_aware_effect(
+        self,
+        history_rep,
+        target_rep,
+        history_mask_weights=None
+    ):
+        """Compute factual score, counterfactual score, and their effect.
 
-        Priority:
-          1) a tensor exposed directly by the base model via cf5_teacher_attr;
-          2) infer the full branch from result_embed when result_embed is a
-             concatenation of two equal-size branches and one of those halves
-             matches mask_rep more closely.
-
-        Returns:
-            Tensor [num_user + num_item, d], or None when it cannot be resolved.
+        The factual view emphasizes history items similar to the target.
+        The counterfactual view reverses only target-specific relevance q -> -q.
+        Static mask prior is identical in both views.
         """
-        # -------------------------------------------------------------
-        # 1) Direct base-class attribute, e.g. self.full_rep.
-        # -------------------------------------------------------------
-        if self.cf5_teacher_attr:
-            teacher = getattr(self, self.cf5_teacher_attr, None)
-            if (
-                torch.is_tensor(teacher)
-                and teacher.dim() == 2
-                and teacher.size(0) >= self.num_user
-            ):
-                return teacher
+        target_similarity = F.cosine_similarity(
+            history_rep,
+            target_rep.unsqueeze(0),
+            dim=1
+        )
 
-        # Common alternative names: harmless fallbacks.
-        for attr_name in (
-            'full_rep',
-            'full_graph_rep',
-            'clean_rep',
-            'original_rep',
-        ):
-            teacher = getattr(self, attr_name, None)
-            if (
-                torch.is_tensor(teacher)
-                and teacher.dim() == 2
-                and teacher.size(0) >= self.num_user
-            ):
-                return teacher
+        factual_logits = target_similarity / self.cf5_target_temperature
+        counter_logits = -target_similarity / self.cf5_target_temperature
 
-        # -------------------------------------------------------------
-        # 2) Infer from concatenated result_embed.
-        #
-        # If result_embed = concat(full_rep, mask_rep) or concat(mask_rep,
-        # full_rep), each half has the same dimensionality as mask_rep.
-        # We identify which half resembles mask_rep and use the other half
-        # as teacher.
-        # -------------------------------------------------------------
-        if (
-            torch.is_tensor(self.result_embed)
-            and torch.is_tensor(getattr(self, 'mask_rep', None))
-            and self.result_embed.dim() == 2
-            and self.mask_rep.dim() == 2
-            and self.result_embed.size(0) == self.mask_rep.size(0)
-            and self.result_embed.size(1) == 2 * self.mask_rep.size(1)
-        ):
-            dim = self.mask_rep.size(1)
-            left = self.result_embed[:, :dim]
-            right = self.result_embed[:, dim:]
+        if self.cf5_cf_use_mask_prior and history_mask_weights is not None:
+            mask_prior = history_mask_weights.clamp_min(self.cf5_cf_mask_eps)
+            if self.cf5_cf_detach_mask_prior:
+                mask_prior = mask_prior.detach()
+            log_mask_prior = torch.log(mask_prior)
+            factual_logits = factual_logits + log_mask_prior
+            counter_logits = counter_logits + log_mask_prior
 
-            with torch.no_grad():
-                mask_ref = self.mask_rep.detach()
-                left_error = F.mse_loss(
-                    left.detach(),
-                    mask_ref
-                )
-                right_error = F.mse_loss(
-                    right.detach(),
-                    mask_ref
-                )
+        factual_attention = torch.softmax(factual_logits, dim=0)
+        counter_attention = torch.softmax(counter_logits, dim=0)
 
-            # The half closer to mask_rep is considered the masked branch;
-            # the other half is the full-graph teacher.
-            if float(left_error.cpu()) <= float(right_error.cpu()):
-                return right
-            return left
+        factual_history = torch.sum(
+            factual_attention.unsqueeze(-1) * history_rep,
+            dim=0
+        )
+        counter_history = torch.sum(
+            counter_attention.unsqueeze(-1) * history_rep,
+            dim=0
+        )
 
-        return None
+        factual_score = F.cosine_similarity(
+            factual_history.unsqueeze(0),
+            target_rep.unsqueeze(0),
+            dim=1
+        ).squeeze(0)
+        counter_score = F.cosine_similarity(
+            counter_history.unsqueeze(0),
+            target_rep.unsqueeze(0),
+            dim=1
+        ).squeeze(0)
 
-    def _calculate_representation_loss(self, interaction, reference_loss):
-        """Finding-2: preserve target-specific similarity in masked branch.
+        effect = factual_score - counter_score
+        return factual_score, counter_score, effect
 
-        Teacher:
-            r_teacher(e, p) = cos(z_e^full, z_p^full)
+    def _calculate_counterfactual_loss(self, interaction, reference_loss):
+        """Counterfactual target-aware ranking loss.
 
-        Student:
-            r_student(e, p) = cos(z_e^mask, z_p^mask)
+        delta_pos = s_fact(u,p+) - s_cf(u,p+)
+        delta_neg = s_fact(u,p-) - s_cf(u,p-)
 
-        Default MSE objective:
-            L_repr = mean_e [
-                r_student(e,p) - stopgrad(r_teacher(e,p))
-            ]^2
+        Objective:
+            delta_pos > delta_neg + margin
 
-        Optional pairwise objective (cf5_repr_mode='pairwise'):
-            if teacher says edge a is more related to target p than edge b,
-            the masked representation is trained to preserve that ordering.
-
-        Importantly, this loss does NOT compare target-specific relevance to
-        a static mask scalar. It optimizes the masked representation itself.
+        L_cf = softplus(
+            (delta_neg - delta_pos + margin) / temperature
+        )
         """
         if not hasattr(self, 'mask_rep') or self.mask_rep is None:
             return reference_loss * 0.0
 
-        teacher_rep = self._get_full_teacher_representation()
-        if teacher_rep is None:
-            self.cf5_stats['repr_teacher_missing'] += 1
+        target_pairs_by_user = self._build_batch_pos_neg_targets(interaction)
+        if not target_pairs_by_user:
             return reference_loss * 0.0
 
-        if (
-            teacher_rep.dim() != 2
-            or teacher_rep.size(0) != self.mask_rep.size(0)
-        ):
-            self.cf5_stats['repr_teacher_missing'] += 1
+        sampled_users = self._sample_cf_users(interaction)
+        self.cf5_stats['cf_samples'] += len(sampled_users)
+        if not sampled_users:
             return reference_loss * 0.0
 
-        mask_item_rep = self.mask_rep[self.num_user:]
-        full_item_rep = teacher_rep[self.num_user:]
-
-        positives_by_user = self._build_batch_positive_targets(interaction)
-        sampled_users = self._sample_repr_users(interaction)
-
-        self.cf5_stats['repr_samples'] += len(sampled_users)
-
-        if not sampled_users or not positives_by_user:
-            return reference_loss * 0.0
-
+        item_rep = self.mask_rep[self.num_user:]
+        mask_weights = self.get_forward_edge_mask()
         losses = []
 
         for user_id in sampled_users:
-            target_candidates = positives_by_user.get(int(user_id), [])
-            if not target_candidates:
+            user_pairs = target_pairs_by_user.get(int(user_id), [])
+            if not user_pairs:
                 continue
 
-            target_item = int(self._cf5_rng.choice(target_candidates))
-
+            pos_item, neg_item = self._cf5_rng.choice(user_pairs)
             if (
-                target_item < 0
-                or target_item >= mask_item_rep.size(0)
-                or target_item >= full_item_rep.size(0)
+                pos_item < 0
+                or neg_item < 0
+                or pos_item >= item_rep.size(0)
+                or neg_item >= item_rep.size(0)
             ):
                 continue
 
@@ -617,102 +521,56 @@ class MASKED_GLORIA_CF5(MASKED_GLORIA):
             )
             history_item_ids = self.forward_edge_items[edge_tensor]
 
-            # Avoid the trivial relation cos(z_p, z_p) = 1 when the target
-            # item is itself already one of the user's graph edges.
-            keep_mask = history_item_ids != target_item
-            history_item_ids = history_item_ids[keep_mask]
+            # Same history for positive and negative; remove either target if
+            # already present to avoid trivial cos(z_p, z_p) = 1.
+            keep = (
+                (history_item_ids != pos_item)
+                & (history_item_ids != neg_item)
+            )
+            history_item_ids = history_item_ids[keep]
+            history_edge_tensor = edge_tensor[keep]
 
             if history_item_ids.numel() < self.cf5_min_history:
                 continue
 
-            self.cf5_stats['repr_eligible'] += 1
+            self.cf5_stats['cf_eligible'] += 1
 
-            # ---------------------------------------------------------
-            # Teacher target: full branch only, stop-gradient.
-            # ---------------------------------------------------------
-            with torch.no_grad():
-                teacher_target = full_item_rep[target_item]
-                teacher_similarity = F.cosine_similarity(
-                    full_item_rep[history_item_ids],
-                    teacher_target.unsqueeze(0),
-                    dim=1
-                )
+            history_rep = item_rep[history_item_ids]
+            history_mask = mask_weights[history_edge_tensor]
+            pos_target_rep = item_rep[pos_item]
+            neg_target_rep = item_rep[neg_item]
 
-            # ---------------------------------------------------------
-            # Student prediction: masked branch, gradient enabled.
-            # ---------------------------------------------------------
-            student_target = mask_item_rep[target_item]
-            student_similarity = F.cosine_similarity(
-                mask_item_rep[history_item_ids],
-                student_target.unsqueeze(0),
-                dim=1
+            pos_fact, pos_counter, pos_effect = self._target_aware_effect(
+                history_rep,
+                pos_target_rep,
+                history_mask
+            )
+            neg_fact, neg_counter, neg_effect = self._target_aware_effect(
+                history_rep,
+                neg_target_rep,
+                history_mask
             )
 
-            if self.cf5_repr_mode == 'mse':
-                user_loss = F.mse_loss(
-                    student_similarity,
-                    teacher_similarity
-                )
-
-            else:
-                # Pairwise preservation of teacher relative ordering.
-                pair_positions = self._sample_cf5_pairs(
-                    int(history_item_ids.numel()),
-                    pair_count=self.cf5_repr_pair_count
-                )
-                if not pair_positions:
-                    continue
-
-                # Vectorized pairwise representation loss: process every
-                # sampled pair of this user in one GPU operation.
-                pair_tensor = torch.as_tensor(
-                    pair_positions,
-                    dtype=torch.long,
-                    device=student_similarity.device
-                )
-                left_pos = pair_tensor[:, 0]
-                right_pos = pair_tensor[:, 1]
-
-                teacher_gap = (
-                    teacher_similarity[left_pos]
-                    - teacher_similarity[right_pos]
-                )
-                student_gap = (
-                    student_similarity[left_pos]
-                    - student_similarity[right_pos]
-                )
-
-                valid = teacher_gap.abs() > self.cf5_similarity_eps
-                if not torch.any(valid):
-                    continue
-
-                teacher_gap = teacher_gap[valid]
-                student_gap = student_gap[valid]
-                direction = torch.sign(teacher_gap)
-
-                pair_losses = F.softplus(
-                    -direction
-                    * student_gap
-                    / self.cf5_repr_temperature
-                )
-                user_loss = pair_losses.mean()
-
+            effect_gap = pos_effect - neg_effect
+            user_loss = F.softplus(
+                (
+                    neg_effect
+                    - pos_effect
+                    + self.cf5_cf_margin
+                ) / self.cf5_cf_temperature
+            )
             losses.append(user_loss)
 
             with torch.no_grad():
-                # One GPU->CPU transfer for all logging scalars of this user.
-                repr_stat_values = torch.stack([
-                    user_loss.detach(),
-                    teacher_similarity.mean(),
-                    student_similarity.mean(),
-                    (student_similarity - teacher_similarity).abs().mean(),
-                ]).cpu().tolist()
-
-                self.cf5_stats['repr_used'] += 1
-                self.cf5_stats['repr_loss_sum'] += repr_stat_values[0]
-                self.cf5_stats['repr_teacher_sim_sum'] += repr_stat_values[1]
-                self.cf5_stats['repr_student_sim_sum'] += repr_stat_values[2]
-                self.cf5_stats['repr_abs_error_sum'] += repr_stat_values[3]
+                self.cf5_stats['cf_used'] += 1
+                self.cf5_stats['cf_loss_sum'] += float(user_loss.detach().cpu())
+                self.cf5_stats['cf_pos_effect_sum'] += float(pos_effect.detach().cpu())
+                self.cf5_stats['cf_neg_effect_sum'] += float(neg_effect.detach().cpu())
+                self.cf5_stats['cf_effect_gap_sum'] += float(effect_gap.detach().cpu())
+                self.cf5_stats['cf_pos_fact_sum'] += float(pos_fact.detach().cpu())
+                self.cf5_stats['cf_pos_counter_sum'] += float(pos_counter.detach().cpu())
+                self.cf5_stats['cf_neg_fact_sum'] += float(neg_fact.detach().cpu())
+                self.cf5_stats['cf_neg_counter_sum'] += float(neg_counter.detach().cpu())
 
         if not losses:
             return reference_loss * 0.0
