@@ -1,5 +1,5 @@
 # coding: utf-8
-"""MASKED_GLORIA with listwise MIPD and Full--Masked KL alignment."""
+"""MASKED_GLORIA with catalog-wide MIPD and branch alignment."""
 
 import math
 
@@ -11,11 +11,11 @@ from models.masked_gloria_mipd import MASKED_GLORIA_MIPD
 
 class MASKED_GLORIA_MIPD_KL(MASKED_GLORIA_MIPD):
     """
-    Align Full and Masked listwise interaction distributions.
+    Align Full and Masked catalog-wide interaction distributions.
 
     The model preserves MASKED_GLORIA_MIPD's concatenated recommendation
-    embeddings.  For every unique mini-batch user, MIPD and KL share one fixed
-    candidate list containing the positive item and K unseen negatives.
+    embeddings. Both MIPD and KL operate on interaction distributions over
+    every catalog item for each unique mini-batch user.
     """
 
     def __init__(self, config, dataset):
@@ -33,8 +33,9 @@ class MASKED_GLORIA_MIPD_KL(MASKED_GLORIA_MIPD):
             raise ValueError('branch_kl_temperature must be positive.')
 
         self.last_branch_kl_loss = None
-        self.last_branch_kl_candidate_count = None
+        self.last_branch_kl_item_count = None
         self.last_branch_kl_user_count = None
+        self.last_mipd_item_count = None
         self.branch_kl_epoch_loss_sum = 0.0
         self.branch_kl_epoch_user_count = 0
         self.branch_kl_epoch_batch_count = 0
@@ -50,9 +51,23 @@ class MASKED_GLORIA_MIPD_KL(MASKED_GLORIA_MIPD):
         self.ranking_epoch_example_count = 0
 
     def post_epoch_processing(self):
-        mipd_info = super(
-            MASKED_GLORIA_MIPD_KL, self
-        ).post_epoch_processing()
+        mean_jsd = (
+            self.mipd_epoch_jsd_sum / self.mipd_epoch_user_count
+            if self.mipd_epoch_user_count > 0
+            else 0.0
+        )
+        mipd_info = (
+            'catalog MIPD: mean_jsd={:.8f}, users={}, batches={}, '
+            'items={}, permutations={}, temperature={}, weight={}'
+        ).format(
+            mean_jsd,
+            self.mipd_epoch_user_count,
+            self.mipd_epoch_batch_count,
+            self.num_item,
+            self.mipd_num_samples,
+            self.mipd_temperature,
+            self.mipd_weight,
+        )
         mean_branch_kl = (
             self.branch_kl_epoch_loss_sum
             / self.branch_kl_epoch_user_count
@@ -67,49 +82,44 @@ class MASKED_GLORIA_MIPD_KL(MASKED_GLORIA_MIPD):
         )
         kl_info = (
             'Full-Masked alignment: mean_ranking_loss={:.8f}, '
-            'mean_kl={:.8f}, users={}, batches={}, candidates={}, '
+            'mean_kl={:.8f}, users={}, batches={}, items={}, '
             'temperature={}, weight={}'
         ).format(
             mean_ranking_loss,
             mean_branch_kl,
             self.branch_kl_epoch_user_count,
             self.branch_kl_epoch_batch_count,
-            self.mipd_num_negatives + 1,
+            self.num_item,
             self.branch_kl_temperature,
             self.branch_kl_weight,
         )
         return '{}\n{}'.format(mipd_info, kl_info)
 
     @staticmethod
-    def _validate_listwise_inputs(user_nodes, candidate_items):
+    def _validate_catalog_users(user_nodes):
         if user_nodes.dim() != 1:
             raise ValueError('user_nodes must be one-dimensional.')
-        if candidate_items.dim() != 2:
-            raise ValueError('candidate_items must have shape [B, K+1].')
-        if candidate_items.size(0) != user_nodes.size(0):
-            raise ValueError('candidate_items and user_nodes must align.')
-        if candidate_items.size(1) < 2:
-            raise ValueError('Each candidate list needs at least two items.')
         if torch.unique(user_nodes).numel() != user_nodes.numel():
-            raise ValueError('Listwise losses need one row per distinct user.')
+            raise ValueError('Catalog losses need one row per distinct user.')
 
-    def calculate_branch_kl(self, user_nodes, candidate_items):
-        """Return KL(P_masked || P_full) on a fixed candidate list."""
-        self._validate_listwise_inputs(user_nodes, candidate_items)
+    def _calculate_catalog_scores(self, user_nodes):
+        """Return raw Full and Masked scores against every catalog item."""
+        self._validate_catalog_users(user_nodes)
 
-        full_users = self.full_user_view[user_nodes]
-        masked_users = self.masked_user_view[user_nodes]
-        full_items = self.full_item_view[candidate_items]
-        masked_items = self.masked_item_view[candidate_items]
+        full_scores = torch.matmul(
+            self.full_user_view[user_nodes],
+            self.full_item_view.t(),
+        )
+        masked_scores = torch.matmul(
+            self.masked_user_view[user_nodes],
+            self.masked_item_view.t(),
+        )
+        return full_scores, masked_scores
 
-        full_logits = torch.sum(
-            full_users[:, None, :] * full_items,
-            dim=-1,
-        ) / self.branch_kl_temperature
-        masked_logits = torch.sum(
-            masked_users[:, None, :] * masked_items,
-            dim=-1,
-        ) / self.branch_kl_temperature
+    def _branch_kl_from_scores(self, full_scores, masked_scores):
+        """Return KL(P_masked || P_full) from catalog-wide raw scores."""
+        full_logits = full_scores / self.branch_kl_temperature
+        masked_logits = masked_scores / self.branch_kl_temperature
 
         log_p_full = F.log_softmax(full_logits, dim=1)
         log_p_masked = F.log_softmax(masked_logits, dim=1)
@@ -119,40 +129,124 @@ class MASKED_GLORIA_MIPD_KL(MASKED_GLORIA_MIPD):
             dim=1,
         ).mean()
 
-    def _calculate_mipd_from_candidates(self, user_nodes, candidate_items):
-        """Calculate MIPD without constructing a second candidate list."""
+    def calculate_branch_kl(self, user_nodes):
+        """Return KL(P_masked || P_full) over the entire item catalog."""
+        full_scores, masked_scores = self._calculate_catalog_scores(user_nodes)
+        return self._branch_kl_from_scores(full_scores, masked_scores)
+
+    def calculate_catalog_mipd(
+        self,
+        user_nodes,
+        full_scores=None,
+        masked_scores=None,
+        permutation=None,
+    ):
+        """Return negative catalog-wide JSD after permuting Masked users."""
+        self._validate_catalog_users(user_nodes)
+        batch_size = int(user_nodes.numel())
+        if full_scores is None or masked_scores is None:
+            if full_scores is not None or masked_scores is not None:
+                raise ValueError(
+                    'full_scores and masked_scores must be supplied together.'
+                )
+            full_scores, masked_scores = self._calculate_catalog_scores(
+                user_nodes
+            )
+        expected_shape = (batch_size, self.num_item)
+        if full_scores.shape != expected_shape:
+            raise ValueError('full_scores must have shape [B, num_items].')
+        if masked_scores.shape != expected_shape:
+            raise ValueError('masked_scores must have shape [B, num_items].')
+        if batch_size < 2:
+            return masked_scores.sum() * 0.0
+
+        masked_users = self.masked_user_view[user_nodes]
+        if permutation is None:
+            permutation = self._sample_derangement(
+                batch_size,
+                masked_users.device,
+            )
+        else:
+            permutation = permutation.to(
+                device=masked_users.device,
+                dtype=torch.long,
+            )
+            if permutation.shape != (batch_size,):
+                raise ValueError('permutation must have shape [B].')
+            if not torch.equal(
+                torch.sort(permutation).values,
+                torch.arange(batch_size, device=masked_users.device),
+            ):
+                raise ValueError('permutation must contain every row once.')
+            if torch.any(
+                permutation
+                == torch.arange(batch_size, device=masked_users.device)
+            ):
+                raise ValueError('permutation must not contain fixed points.')
+
+        original_logits = (
+            full_scores.detach() + masked_scores
+        ) / self.mipd_temperature
+        permuted_masked_scores = torch.matmul(
+            masked_users[permutation],
+            self.masked_item_view.t(),
+        )
+        permuted_logits = (
+            full_scores.detach() + permuted_masked_scores
+        ) / self.mipd_temperature
+        return -self._js_divergence_from_logits(
+            original_logits,
+            permuted_logits,
+        )
+
+    def _calculate_catalog_mipd_from_scores(
+        self,
+        user_nodes,
+        full_scores,
+        masked_scores,
+    ):
+        """Average catalog-wide MIPD over configured permutations."""
         batch_size = int(user_nodes.numel())
         if self.mipd_weight == 0.0 or batch_size < 2:
-            zero = self.masked_user_view[user_nodes].sum() * 0.0
+            zero = masked_scores.sum() * 0.0
             self.last_mipd_user_count = 0
             self.last_mipd_candidate_count = 0
+            self.last_mipd_item_count = 0
             return zero, zero.detach()
 
         self.last_mipd_user_count = batch_size
-        self.last_mipd_candidate_count = int(candidate_items.size(1))
+        # Retain the parent's diagnostic attribute for compatibility. In this
+        # subclass the "candidate" set is the complete item catalog.
+        self.last_mipd_candidate_count = int(self.num_item)
+        self.last_mipd_item_count = int(self.num_item)
         losses = [
-            self.calculate_listwise_mipd(user_nodes, candidate_items)
+            self.calculate_catalog_mipd(
+                user_nodes,
+                full_scores=full_scores,
+                masked_scores=masked_scores,
+            )
             for _ in range(self.mipd_num_samples)
         ]
         mipd_loss = torch.stack(losses).mean()
         return mipd_loss, (-mipd_loss).detach()
 
-    def _calculate_branch_kl_from_candidates(
+    def _calculate_branch_kl_from_scores(
         self,
         user_nodes,
-        candidate_items,
+        full_scores,
+        masked_scores,
     ):
         """Calculate branch KL or a differentiable zero when disabled."""
         batch_size = int(user_nodes.numel())
         if self.branch_kl_weight == 0.0 or batch_size == 0:
             zero = self.masked_user_view[user_nodes].sum() * 0.0
             self.last_branch_kl_user_count = 0
-            self.last_branch_kl_candidate_count = 0
+            self.last_branch_kl_item_count = 0
             return zero
 
         self.last_branch_kl_user_count = batch_size
-        self.last_branch_kl_candidate_count = int(candidate_items.size(1))
-        return self.calculate_branch_kl(user_nodes, candidate_items)
+        self.last_branch_kl_item_count = int(self.num_item)
+        return self._branch_kl_from_scores(full_scores, masked_scores)
 
     def calculate_loss(self, interaction):
         pos_scores, neg_scores = self.forward(interaction)
@@ -160,24 +254,26 @@ class MASKED_GLORIA_MIPD_KL(MASKED_GLORIA_MIPD):
         ranking_loss = ranking_loss / math.log(2.0)
 
         if self.mipd_weight > 0.0 or self.branch_kl_weight > 0.0:
-            # This is the only candidate-builder call in a training step.  Both
-            # listwise objectives below receive these exact item IDs.
-            user_nodes, candidate_items = self._build_mipd_candidates(
-                interaction
+            all_users = interaction[0].detach().view(-1)
+            positions = self._first_unique_user_positions(all_users)
+            user_nodes = all_users[positions]
+            full_scores, masked_scores = self._calculate_catalog_scores(
+                user_nodes
             )
         else:
             user_nodes = interaction[0].detach().new_empty((0,))
-            candidate_items = interaction[0].detach().new_empty(
-                (0, self.mipd_num_negatives + 1)
-            )
+            full_scores = self.full_item_view.new_empty((0, self.num_item))
+            masked_scores = self.masked_item_view.new_empty((0, self.num_item))
 
-        mipd_loss, mipd_jsd = self._calculate_mipd_from_candidates(
+        mipd_loss, mipd_jsd = self._calculate_catalog_mipd_from_scores(
             user_nodes,
-            candidate_items,
+            full_scores,
+            masked_scores,
         )
-        branch_kl_loss = self._calculate_branch_kl_from_candidates(
+        branch_kl_loss = self._calculate_branch_kl_from_scores(
             user_nodes,
-            candidate_items,
+            full_scores,
+            masked_scores,
         )
         total_loss = (
             ranking_loss
