@@ -1,0 +1,22 @@
+{
+  "count": 120464,
+  "mean": 0.9986788034439087,
+  "standard_deviation": 0.001941906986758113,
+  "minimum": 0.9473179578781128,
+  "maximum": 0.9999998807907104,
+  "count_below_plot_x_min": 2,
+  "quantiles": {
+    "0.00": 0.9473179578781128,
+    "0.01": 0.9913993191719055,
+    "0.05": 0.9953561514616013,
+    "0.25": 0.998275488615036,
+    "0.50": 0.9993450045585632,
+    "0.75": 0.9998078495264053,
+    "0.95": 0.9999641180038452,
+    "0.99": 0.9999872446060181,
+    "1.00": 0.9999998807907104
+  },
+  "checkpoint": "C:\\study\\Master_papers\\Robust MM\\CaMuRe\\saved\\MASKED_GLORIA-book-seed999-Aug-12-2026-13-46-25.pth",
+  "interactions": "C:\\study\\Master_papers\\Robust MM\\CaMuRe\\data\\book\\book.inter",
+  "comparison": "baseline final user embedding vs. final user embedding after setting one learned masked-branch edge to zero"
+}

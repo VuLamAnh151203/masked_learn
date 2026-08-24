@@ -1,0 +1,159 @@
+{
+  "checkpoint": "C:\\study\\Master_papers\\Robust MM\\CaMuRe\\saved\\MASKED_GLORIA-book-seed999-Aug-12-2026-13-46-25.pth",
+  "test_user_count": 9860,
+  "test_interaction_count": 40106,
+  "cutoffs": [
+    5,
+    10,
+    15,
+    20
+  ],
+  "case_cutoff": 20,
+  "case_definitions": {
+    "full_wins": "Recall(full) > Recall(masked)",
+    "masked_wins": "Recall(masked) > Recall(full)",
+    "full_only_success": "full has a hit and masked has zero hits",
+    "masked_only_success": "masked has a hit and full has zero hits",
+    "both_fail_fusion_wins": "full and masked each have zero hits, fused has at least one hit"
+  },
+  "case_counts": {
+    "full_wins": 2591,
+    "masked_wins": 736,
+    "branches_tie": 6533,
+    "full_only_success": 2205,
+    "masked_only_success": 589,
+    "both_branches_succeed": 1463,
+    "both_fail_fusion_wins": 470,
+    "both_fail_all": 5133,
+    "fusion_beats_both": 1003
+  },
+  "case_percentages_of_test_users": {
+    "full_wins": 26.27789046653144,
+    "masked_wins": 7.464503042596349,
+    "branches_tie": 66.2576064908722,
+    "full_only_success": 22.363083164300203,
+    "masked_only_success": 5.9736308316430025,
+    "both_branches_succeed": 14.837728194726166,
+    "both_fail_fusion_wins": 4.766734279918864,
+    "both_fail_all": 52.05882352941177,
+    "fusion_beats_both": 10.172413793103448
+  },
+  "metrics": {
+    "full": {
+      "5": {
+        "recall": 0.06722932835246401,
+        "ndcg": 0.06699291638180782,
+        "precision": 0.044563894523326576,
+        "map": 0.04382564232589588
+      },
+      "10": {
+        "recall": 0.10353631126320578,
+        "ndcg": 0.0798031153773537,
+        "precision": 0.03589249492900609,
+        "map": 0.046784905501153204
+      },
+      "15": {
+        "recall": 0.1312335799572322,
+        "ndcg": 0.08923371850441954,
+        "precision": 0.03103448275862069,
+        "map": 0.049102845874914786
+      },
+      "20": {
+        "recall": 0.15381729287527018,
+        "ndcg": 0.09642657599406103,
+        "precision": 0.027707910750507103,
+        "map": 0.050693653398373034
+      }
+    },
+    "masked": {
+      "5": {
+        "recall": 0.04604442629399117,
+        "ndcg": 0.043411978864317385,
+        "precision": 0.026592292089249497,
+        "map": 0.02923611111111111
+      },
+      "10": {
+        "recall": 0.06499049756802301,
+        "ndcg": 0.04994360800210771,
+        "precision": 0.01943204868154158,
+        "map": 0.030823542683356867
+      },
+      "15": {
+        "recall": 0.07776893468073705,
+        "ndcg": 0.054297359135168505,
+        "precision": 0.015875591615956728,
+        "map": 0.031922981721800484
+      },
+      "20": {
+        "recall": 0.08702436183310153,
+        "ndcg": 0.057241417287473416,
+        "precision": 0.013524340770791078,
+        "map": 0.03255036714868391
+      }
+    },
+    "fused": {
+      "5": {
+        "recall": 0.08507297642123723,
+        "ndcg": 0.08517825325383911,
+        "precision": 0.05651115618661258,
+        "map": 0.056212812711291416
+      },
+      "10": {
+        "recall": 0.12616725298098835,
+        "ndcg": 0.09875433629184534,
+        "precision": 0.043438133874239344,
+        "map": 0.059119435529639705
+      },
+      "15": {
+        "recall": 0.1533045576846931,
+        "ndcg": 0.10780463188967448,
+        "precision": 0.03621365787694388,
+        "map": 0.061303831643279995
+      },
+      "20": {
+        "recall": 0.17801922003642395,
+        "ndcg": 0.11573583835280778,
+        "precision": 0.0320841784989858,
+        "map": 0.06314378345249767
+      }
+    }
+  },
+  "example_user_ids": {
+    "full_wins": [
+      26,
+      251,
+      294,
+      441,
+      493,
+      509,
+      521,
+      720,
+      838,
+      840
+    ],
+    "masked_wins": [
+      8,
+      37,
+      53,
+      100,
+      247,
+      400,
+      567,
+      657,
+      663,
+      674
+    ],
+    "both_fail_fusion_wins": [
+      1564,
+      1597,
+      2124,
+      2144,
+      2478,
+      2490,
+      2606,
+      2732,
+      2734,
+      2782
+    ]
+  }
+}
