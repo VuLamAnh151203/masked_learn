@@ -46,10 +46,13 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         # Defaults keep the feature active without requiring changes in old
         # configuration files.  Set mipd_weight to 0.0 to disable it.
         self.mipd_weight = float(
-            self._get_config_value(config, 'mipd_weight', 0.5)
+            self._get_config_value(config, 'mipd_weight', 0.01)
         )
         self.mipd_num_samples = int(
-            self._get_config_value(config, 'mipd_num_samples', 30)
+            self._get_config_value(config, 'mipd_num_samples', 3)
+        )
+        self.mipd_num_negatives = int(
+            self._get_config_value(config, 'mipd_num_negatives', 32)
         )
         self.mipd_temperature = float(
             self._get_config_value(config, 'mipd_temperature', 1.0)
@@ -58,6 +61,10 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             raise ValueError('mipd_weight must be non-negative.')
         if self.mipd_num_samples < 1:
             raise ValueError('mipd_num_samples must be at least 1.')
+        if self.mipd_num_negatives < 2:
+            raise ValueError(
+                'mipd_num_negatives must be at least 2 for listwise JSD.'
+            )
         if self.mipd_temperature <= 0.0:
             raise ValueError('mipd_temperature must be positive.')
 
@@ -66,6 +73,7 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         self.last_ranking_loss = None
         self.last_mipd_loss = None
         self.last_mipd_jsd = None
+        self.last_mipd_candidate_count = None
         self.drop_rate = 0.1
         self.t_rep = None
         self.t_preference = None
@@ -402,67 +410,111 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             + F.kl_div(log_mixture, q, reduction='batchmean')
         )
 
-    def _get_view_preference_features(self, interaction):
-        """
-        Return sample-level Full and Mask features for BPR triplets.
+    def _build_mipd_candidates(self, interaction):
+        """Build one listwise candidate set for every training triplet.
 
-        For a triplet (u, i+, i-), each view is represented by
-        u * (i+ - i-).  Summing its last dimension gives exactly that view's
-        contribution to the positive-minus-negative ranking margin.
+        Candidate position 0 is the positive item, position 1 is the sampled
+        BPR negative, and the remaining positions are positives belonging to
+        other rows in the mini-batch. ``mipd_num_negatives`` counts all
+        negatives, including the original BPR negative.  Non-zero row offsets
+        keep a row from selecting its own positive as an additional negative.
         """
-        user_nodes, pos_item_nodes, neg_item_nodes = (
-            interaction[0], interaction[1], interaction[2]
+        pos_item_nodes = interaction[1]
+        neg_item_nodes = interaction[2]
+        batch_size = pos_item_nodes.size(0)
+
+        row_ids = torch.arange(
+            batch_size,
+            device=pos_item_nodes.device
+        ).unsqueeze(1)
+        num_in_batch_negatives = self.mipd_num_negatives - 1
+        available_offsets = batch_size - 1
+
+        # Use every non-self offset at most once before repeating.  This avoids
+        # duplicated candidate rows when the requested count fits the batch.
+        offset_chunks = []
+        remaining = num_in_batch_negatives
+        while remaining > 0:
+            random_offsets = torch.randperm(
+                available_offsets,
+                device=pos_item_nodes.device
+            ) + 1
+            take = min(remaining, available_offsets)
+            offset_chunks.append(random_offsets[:take])
+            remaining -= take
+        offsets = torch.cat(offset_chunks).unsqueeze(0)
+        sampled_rows = (row_ids + offsets) % batch_size
+        in_batch_negatives = pos_item_nodes[sampled_rows]
+
+        return torch.cat(
+            [
+                pos_item_nodes.unsqueeze(1),
+                neg_item_nodes.unsqueeze(1),
+                in_batch_negatives
+            ],
+            dim=1
         )
 
-        full_feature = self.full_user_view[user_nodes] * (
-            self.full_item_view[pos_item_nodes]
-            - self.full_item_view[neg_item_nodes]
-        )
-        masked_feature = self.masked_user_view[user_nodes] * (
-            self.masked_item_view[pos_item_nodes]
-            - self.masked_item_view[neg_item_nodes]
-        )
-        return full_feature, masked_feature
+    @staticmethod
+    def _sample_derangement(batch_size, device):
+        """Return a random permutation with no row mapped to itself."""
+        order = torch.randperm(batch_size, device=device)
+        permutation = torch.empty_like(order)
+        permutation[order] = torch.roll(order, shifts=1, dims=0)
+        return permutation
 
     def calculate_mipd_loss(self, interaction):
         """
-        Estimate Mask's task-relevant complementary contribution with MIPD.
+        Estimate Mask's contribution with listwise MIPD.
 
-        The Full feature is the fixed conditioning view.  Only the sample-level
-        Mask feature is permuted after both GCN branches have run.  Minimizing
-        the returned negative JSD maximizes the prediction change caused by
-        breaking the Full-Mask pairing.
+        For every user, JSD is computed over the ranking distribution of one
+        positive and multiple negative candidates.  Full scores are fixed.
+        Perturbation replaces only the post-GCN Mask user representation with
+        that of another user while retaining the same candidate items.
         """
-        full_feature, masked_feature = self._get_view_preference_features(
-            interaction
-        )
-        batch_size = masked_feature.size(0)
+        user_nodes = interaction[0]
+        batch_size = user_nodes.size(0)
         if batch_size < 2 or self.mipd_weight == 0.0:
-            zero = masked_feature.sum() * 0.0
+            zero = self.masked_user_view[user_nodes].sum() * 0.0
+            self.last_mipd_candidate_count = 0
             return zero, zero.detach()
 
-        # Asymmetric MIPD: Full is the conditioning/anchor branch for this
-        # regularizer.  It is still trained normally by the ranking loss.
-        full_feature = full_feature.detach()
-        base_margin = (full_feature + masked_feature).sum(dim=1)
-        base_logits = torch.stack(
-            [torch.zeros_like(base_margin), base_margin],
-            dim=1
+        candidate_items = self._build_mipd_candidates(interaction)
+        self.last_mipd_candidate_count = candidate_items.size(1)
+
+        # Shapes: users [B, D], items [B, C, D], scores [B, C].
+        full_users = self.full_user_view[user_nodes]
+        masked_users = self.masked_user_view[user_nodes]
+        full_items = self.full_item_view[candidate_items]
+        masked_items = self.masked_item_view[candidate_items]
+
+        # Full is the conditioning/anchor view for MIPD.  Detaching the score
+        # prevents this regularizer from changing either Full users or items.
+        full_scores = torch.sum(
+            full_users.unsqueeze(1) * full_items,
+            dim=-1
+        ).detach()
+        masked_scores = torch.sum(
+            masked_users.unsqueeze(1) * masked_items,
+            dim=-1
+        )
+        base_logits = (
+            full_scores + masked_scores
         ) / self.mipd_temperature
 
         jsd_values = []
         for _ in range(self.mipd_num_samples):
-            permutation = torch.randperm(
+            permutation = self._sample_derangement(
                 batch_size,
-                device=masked_feature.device
+                device=masked_users.device
             )
-            shuffled_masked_feature = masked_feature[permutation]
-            perturbed_margin = (
-                full_feature + shuffled_masked_feature
-            ).sum(dim=1)
-            perturbed_logits = torch.stack(
-                [torch.zeros_like(perturbed_margin), perturbed_margin],
-                dim=1
+            permuted_masked_users = masked_users[permutation]
+            permuted_masked_scores = torch.sum(
+                permuted_masked_users.unsqueeze(1) * masked_items,
+                dim=-1
+            )
+            perturbed_logits = (
+                full_scores + permuted_masked_scores
             ) / self.mipd_temperature
             jsd_values.append(
                 self._js_divergence_from_logits(
