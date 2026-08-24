@@ -14,3 +14,9 @@ user_feature_file: 'user_feat.npy'
 
 
 field_separator: "\t"
+
+# MASKED_GLORIA_MIPD listwise experiment. Other models ignore these fields.
+mipd_weight: 0.1
+mipd_num_negatives: 64
+mipd_num_samples: 30
+mipd_temperature: 1.0

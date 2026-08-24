@@ -160,7 +160,7 @@ class ListwiseMipdTest(unittest.TestCase):
             ]
         )
         torch.manual_seed(123)
-        users, candidates = model._build_listwise_candidates(interaction)
+        users, candidates = model._build_mipd_candidates(interaction)
 
         self.assertEqual(users.tolist(), [0, 1, 2])
         self.assertEqual(candidates.shape, (3, 3))
@@ -175,7 +175,7 @@ class ListwiseMipdTest(unittest.TestCase):
 
     def test_derangement_has_no_fixed_points(self):
         torch.manual_seed(7)
-        permutation = MASKED_GLORIA_MIPD._deranged_permutation(20, 'cpu')
+        permutation = MASKED_GLORIA_MIPD._sample_derangement(20, 'cpu')
         self.assertEqual(sorted(permutation.tolist()), list(range(20)))
         self.assertTrue(torch.all(permutation != torch.arange(20)))
 

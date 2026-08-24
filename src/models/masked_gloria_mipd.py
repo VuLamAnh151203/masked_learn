@@ -74,6 +74,10 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         self.last_mipd_loss = None
         self.last_mipd_jsd = None
         self.last_mipd_candidate_count = None
+        self.last_mipd_user_count = None
+        self.mipd_epoch_jsd_sum = 0.0
+        self.mipd_epoch_user_count = 0
+        self.mipd_epoch_batch_count = 0
         self.drop_rate = 0.1
         self.t_rep = None
         self.t_preference = None
@@ -111,6 +115,7 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         self.forward_edge_index = edge_index
         self.forward_edge_users = edge_index[0]
         self.forward_edge_items = edge_index[1] - self.num_user
+        self.mipd_seen_items = self._build_mipd_seen_items()
 
         self.edge_index = torch.cat(
                             [edge_index, edge_index[[1, 0]]],
@@ -221,6 +226,42 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         except (KeyError, TypeError):
             return default
         return default if value is None else value
+
+
+    def _build_mipd_seen_items(self):
+        """Cache training items per user for valid negative sampling."""
+        histories = [set() for _ in range(self.num_user)]
+        users = self.forward_edge_users.detach().cpu().tolist()
+        items = self.forward_edge_items.detach().cpu().tolist()
+        for user_id, item_id in zip(users, items):
+            histories[int(user_id)].add(int(item_id))
+        return tuple(frozenset(history) for history in histories)
+
+    def pre_epoch_processing(self):
+        self.mipd_epoch_jsd_sum = 0.0
+        self.mipd_epoch_user_count = 0
+        self.mipd_epoch_batch_count = 0
+
+    def post_epoch_processing(self):
+        mean_jsd = (
+            self.mipd_epoch_jsd_sum / self.mipd_epoch_user_count
+            if self.mipd_epoch_user_count > 0
+            else 0.0
+        )
+        return (
+            'listwise MIPD: mean_jsd={:.8f}, users={}, batches={}, '
+            'candidates={}, negatives={}, permutations={}, temperature={}, '
+            'weight={}'
+        ).format(
+            mean_jsd,
+            self.mipd_epoch_user_count,
+            self.mipd_epoch_batch_count,
+            self.mipd_num_negatives + 1,
+            self.mipd_num_negatives,
+            self.mipd_num_samples,
+            self.mipd_temperature,
+            self.mipd_weight
+        )
 
 
     def get_knn_adj_mat(self, mm_embeddings):
@@ -410,49 +451,120 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             + F.kl_div(log_mixture, q, reduction='batchmean')
         )
 
+    @staticmethod
+    def _first_unique_user_positions(user_nodes):
+        """Select one training row for each distinct mini-batch user."""
+        positions = []
+        seen = set()
+        for position, user_id in enumerate(
+            user_nodes.detach().view(-1).cpu().tolist()
+        ):
+            user_id = int(user_id)
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            positions.append(position)
+        return torch.as_tensor(
+            positions,
+            dtype=torch.long,
+            device=user_nodes.device
+        )
+
     def _build_mipd_candidates(self, interaction):
-        """Build one listwise candidate set for every training triplet.
+        """Build ``[positive, K unique unseen negatives]`` per unique user."""
+        if interaction is None or len(interaction) < 2:
+            raise ValueError(
+                'interaction must contain users and positive items.'
+            )
 
-        Candidate position 0 is the positive item, position 1 is the sampled
-        BPR negative, and the remaining positions are positives belonging to
-        other rows in the mini-batch. ``mipd_num_negatives`` counts all
-        negatives, including the original BPR negative.  Non-zero row offsets
-        keep a row from selecting its own positive as an additional negative.
-        """
-        pos_item_nodes = interaction[1]
-        neg_item_nodes = interaction[2]
-        batch_size = pos_item_nodes.size(0)
+        all_users = interaction[0].detach().view(-1)
+        all_positives = interaction[1].detach().view(-1)
+        if all_users.numel() != all_positives.numel():
+            raise ValueError('user and positive-item tensors must align.')
 
-        row_ids = torch.arange(
-            batch_size,
-            device=pos_item_nodes.device
-        ).unsqueeze(1)
-        num_in_batch_negatives = self.mipd_num_negatives - 1
-        available_offsets = batch_size - 1
+        positions = self._first_unique_user_positions(all_users)
+        user_nodes = all_users[positions]
+        positive_items = all_positives[positions]
+        supplied_negatives = None
+        if len(interaction) >= 3:
+            all_negatives = interaction[2].detach().view(-1)
+            if all_negatives.numel() == all_users.numel():
+                supplied_negatives = all_negatives[positions]
 
-        # Use every non-self offset at most once before repeating.  This avoids
-        # duplicated candidate rows when the requested count fits the batch.
-        offset_chunks = []
-        remaining = num_in_batch_negatives
-        while remaining > 0:
-            random_offsets = torch.randperm(
-                available_offsets,
-                device=pos_item_nodes.device
-            ) + 1
-            take = min(remaining, available_offsets)
-            offset_chunks.append(random_offsets[:take])
-            remaining -= take
-        offsets = torch.cat(offset_chunks).unsqueeze(0)
-        sampled_rows = (row_ids + offsets) % batch_size
-        in_batch_negatives = pos_item_nodes[sampled_rows]
+        batch_size = int(user_nodes.numel())
+        negative_count = int(self.mipd_num_negatives)
+        if batch_size == 0:
+            empty = positive_items.new_empty((0, negative_count + 1))
+            return user_nodes, empty
 
-        return torch.cat(
-            [
-                pos_item_nodes.unsqueeze(1),
-                neg_item_nodes.unsqueeze(1),
-                in_batch_negatives
-            ],
-            dim=1
+        # Oversample once for the entire mini-batch, then filter histories and
+        # duplicates on CPU. This costs one device synchronization, not one per
+        # user. A deterministic scan handles the rare insufficient row.
+        draw_count = max(negative_count * 3, negative_count + 32)
+        random_pool = torch.randint(
+            self.num_item,
+            (batch_size, draw_count),
+            device=user_nodes.device
+        ).cpu().numpy()
+        users_cpu = user_nodes.cpu().tolist()
+        positives_cpu = positive_items.cpu().tolist()
+        supplied_cpu = (
+            supplied_negatives.cpu().tolist()
+            if supplied_negatives is not None
+            else [None] * batch_size
+        )
+
+        candidate_rows = []
+        for row, (user_id, positive_id, supplied_id) in enumerate(
+            zip(users_cpu, positives_cpu, supplied_cpu)
+        ):
+            user_id = int(user_id)
+            positive_id = int(positive_id)
+            excluded = set(self.mipd_seen_items[user_id])
+            excluded.add(positive_id)
+            available_count = self.num_item - len(excluded)
+            if available_count < negative_count:
+                raise ValueError(
+                    'User {} has only {} unseen items, but MIPD needs {}.'
+                    .format(user_id, available_count, negative_count)
+                )
+
+            selected = []
+            selected_set = set()
+
+            def add_negative(item_id):
+                if item_id is None:
+                    return
+                item_id = int(item_id)
+                if (
+                    item_id < 0
+                    or item_id >= self.num_item
+                    or item_id in excluded
+                    or item_id in selected_set
+                ):
+                    return
+                selected.append(item_id)
+                selected_set.add(item_id)
+
+            add_negative(supplied_id)
+            for item_id in random_pool[row]:
+                add_negative(item_id)
+                if len(selected) == negative_count:
+                    break
+
+            if len(selected) < negative_count:
+                start = int(random_pool[row, 0])
+                for offset in range(self.num_item):
+                    add_negative((start + offset) % self.num_item)
+                    if len(selected) == negative_count:
+                        break
+
+            candidate_rows.append([positive_id] + selected)
+
+        return user_nodes, torch.as_tensor(
+            candidate_rows,
+            dtype=torch.long,
+            device=user_nodes.device
         )
 
     @staticmethod
@@ -463,6 +575,79 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         permutation[order] = torch.roll(order, shifts=1, dims=0)
         return permutation
 
+    def calculate_listwise_mipd(
+        self,
+        user_nodes,
+        candidate_items,
+        permutation=None
+    ):
+        """Return negative JSD for fixed candidates and permuted Mask users."""
+        if user_nodes.dim() != 1:
+            raise ValueError('user_nodes must be one-dimensional.')
+        if candidate_items.dim() != 2:
+            raise ValueError('candidate_items must have shape [B, K+1].')
+        if candidate_items.size(0) != user_nodes.size(0):
+            raise ValueError('candidate_items and user_nodes must align.')
+        if candidate_items.size(1) < 2:
+            raise ValueError('Each candidate list needs at least two items.')
+
+        batch_size = int(user_nodes.size(0))
+        masked_users = self.masked_user_view[user_nodes]
+        if batch_size < 2:
+            return masked_users.sum() * 0.0
+        if torch.unique(user_nodes).numel() != batch_size:
+            raise ValueError('Listwise MIPD needs one row per distinct user.')
+
+        full_users = self.full_user_view[user_nodes]
+        full_items = self.full_item_view[candidate_items]
+        masked_items = self.masked_item_view[candidate_items]
+        full_scores = torch.sum(
+            full_users[:, None, :] * full_items,
+            dim=-1
+        ).detach()
+        masked_scores = torch.sum(
+            masked_users[:, None, :] * masked_items,
+            dim=-1
+        )
+        original_logits = (
+            full_scores + masked_scores
+        ) / self.mipd_temperature
+
+        if permutation is None:
+            permutation = self._sample_derangement(
+                batch_size,
+                masked_users.device
+            )
+        else:
+            permutation = permutation.to(
+                device=masked_users.device,
+                dtype=torch.long
+            )
+            if permutation.shape != (batch_size,):
+                raise ValueError('permutation must have shape [B].')
+            if not torch.equal(
+                torch.sort(permutation).values,
+                torch.arange(batch_size, device=masked_users.device)
+            ):
+                raise ValueError('permutation must contain every row once.')
+            if torch.any(
+                permutation
+                == torch.arange(batch_size, device=masked_users.device)
+            ):
+                raise ValueError('permutation must not contain fixed points.')
+
+        permuted_masked_scores = torch.sum(
+            masked_users[permutation, None, :] * masked_items,
+            dim=-1
+        )
+        permuted_logits = (
+            full_scores + permuted_masked_scores
+        ) / self.mipd_temperature
+        return -self._js_divergence_from_logits(
+            original_logits,
+            permuted_logits
+        )
+
     def calculate_mipd_loss(self, interaction):
         """
         Estimate Mask's contribution with listwise MIPD.
@@ -472,59 +657,33 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         Perturbation replaces only the post-GCN Mask user representation with
         that of another user while retaining the same candidate items.
         """
-        user_nodes = interaction[0]
+        if self.mipd_weight == 0.0:
+            user_nodes = interaction[0].detach().view(-1)
+            zero = self.masked_user_view[user_nodes].sum() * 0.0
+            self.last_mipd_user_count = 0
+            self.last_mipd_candidate_count = 0
+            return zero, zero.detach()
+
+        user_nodes, candidate_items = self._build_mipd_candidates(interaction)
         batch_size = user_nodes.size(0)
-        if batch_size < 2 or self.mipd_weight == 0.0:
+        self.last_mipd_user_count = int(batch_size)
+        if batch_size < 2:
             zero = self.masked_user_view[user_nodes].sum() * 0.0
             self.last_mipd_candidate_count = 0
             return zero, zero.detach()
 
-        candidate_items = self._build_mipd_candidates(interaction)
         self.last_mipd_candidate_count = candidate_items.size(1)
-
-        # Shapes: users [B, D], items [B, C, D], scores [B, C].
-        full_users = self.full_user_view[user_nodes]
-        masked_users = self.masked_user_view[user_nodes]
-        full_items = self.full_item_view[candidate_items]
-        masked_items = self.masked_item_view[candidate_items]
-
-        # Full is the conditioning/anchor view for MIPD.  Detaching the score
-        # prevents this regularizer from changing either Full users or items.
-        full_scores = torch.sum(
-            full_users.unsqueeze(1) * full_items,
-            dim=-1
-        ).detach()
-        masked_scores = torch.sum(
-            masked_users.unsqueeze(1) * masked_items,
-            dim=-1
-        )
-        base_logits = (
-            full_scores + masked_scores
-        ) / self.mipd_temperature
-
-        jsd_values = []
+        mipd_losses = []
         for _ in range(self.mipd_num_samples):
-            permutation = self._sample_derangement(
-                batch_size,
-                device=masked_users.device
-            )
-            permuted_masked_users = masked_users[permutation]
-            permuted_masked_scores = torch.sum(
-                permuted_masked_users.unsqueeze(1) * masked_items,
-                dim=-1
-            )
-            perturbed_logits = (
-                full_scores + permuted_masked_scores
-            ) / self.mipd_temperature
-            jsd_values.append(
-                self._js_divergence_from_logits(
-                    base_logits,
-                    perturbed_logits
+            mipd_losses.append(
+                self.calculate_listwise_mipd(
+                    user_nodes,
+                    candidate_items
                 )
             )
 
-        mipd_jsd = torch.stack(jsd_values).mean()
-        mipd_loss = -mipd_jsd
+        mipd_loss = torch.stack(mipd_losses).mean()
+        mipd_jsd = -mipd_loss.detach()
         return mipd_loss, mipd_jsd.detach()
 
     def forward(self, interaction):
@@ -558,6 +717,10 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         self.last_ranking_loss = ranking_loss.detach()
         self.last_mipd_loss = mipd_loss.detach()
         self.last_mipd_jsd = mipd_jsd
+        user_count = int(self.last_mipd_user_count or 0)
+        self.mipd_epoch_jsd_sum += float(mipd_jsd.cpu()) * user_count
+        self.mipd_epoch_user_count += user_count
+        self.mipd_epoch_batch_count += 1
         return total_loss
 
     def full_sort_predict(self, interaction):
