@@ -18,7 +18,7 @@ field_separator: "\t"
 # MASKED_GLORIA_MIPD listwise experiment. Other models ignore these fields.
 mipd_weight: 0.01
 mipd_num_negatives: 32
-mipd_num_samples: 10
+mipd_num_samples: 3
 mipd_temperature: 1.0
 
 # MASKED_GLORIA_MIPD_KL Full-Masked distribution alignment.
