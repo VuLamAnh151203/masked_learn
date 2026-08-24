@@ -46,10 +46,10 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         # Defaults keep the feature active without requiring changes in old
         # configuration files.  Set mipd_weight to 0.0 to disable it.
         self.mipd_weight = float(
-            self._get_config_value(config, 'mipd_weight', 0.01)
+            self._get_config_value(config, 'mipd_weight', 0.1)
         )
         self.mipd_num_samples = int(
-            self._get_config_value(config, 'mipd_num_samples', 3)
+            self._get_config_value(config, 'mipd_num_samples', 10)
         )
         self.mipd_temperature = float(
             self._get_config_value(config, 'mipd_temperature', 1.0)
