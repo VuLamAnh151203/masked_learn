@@ -59,6 +59,8 @@ def make_model():
     model.directional_temperature = 0.7
     model.directional_negative_sampling = 'random'
     model.directional_hard_pool_size = 6
+    model.directional_permutation_gradient = 'symmetric'
+    model.directional_loss_type = 'softplus'
     model.full_user_view = torch.tensor(
         [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
         requires_grad=True,
@@ -210,16 +212,16 @@ class DirectionalPermutationTest(unittest.TestCase):
             (full_scores + permuted_masked_scores)
             / model.directional_temperature,
             dim=1,
-        )[:, 0].detach()
+        )[:, 0]
         expected_gap = original_log_prob - permuted_log_prob
-        expected_loss = F.relu(
+        expected_loss = F.softplus(
             model.directional_margin - expected_gap
         ).mean()
 
         self.assertTrue(torch.allclose(actual_gap, expected_gap, atol=1e-7))
         self.assertTrue(torch.allclose(actual_loss, expected_loss, atol=1e-7))
 
-    def test_directional_gradient_updates_only_original_mask_path(self):
+    def test_symmetric_gradient_updates_mask_but_not_full(self):
         model = make_model()
         loss, _ = model.calculate_directional_for_permutation(
             self.users,
@@ -235,8 +237,40 @@ class DirectionalPermutationTest(unittest.TestCase):
         self.assertGreater(model.masked_user_view.grad.abs().sum().item(), 0.0)
         self.assertGreater(model.masked_item_view.grad.abs().sum().item(), 0.0)
 
+    def test_symmetric_and_detached_permutation_gradients_differ(self):
+        symmetric = make_model()
+        detached = make_model()
+        detached.directional_permutation_gradient = 'detached'
+
+        symmetric_loss, _ = symmetric.calculate_directional_for_permutation(
+            self.users,
+            self.candidates,
+            permutation=self.permutation,
+        )
+        detached_loss, _ = detached.calculate_directional_for_permutation(
+            self.users,
+            self.candidates,
+            permutation=self.permutation,
+        )
+        symmetric_loss.backward()
+        detached_loss.backward()
+
+        self.assertFalse(
+            torch.allclose(
+                symmetric.masked_user_view.grad,
+                detached.masked_user_view.grad,
+            )
+        )
+        self.assertFalse(
+            torch.allclose(
+                symmetric.masked_item_view.grad,
+                detached.masked_item_view.grad,
+            )
+        )
+
     def test_helpful_pairings_satisfy_margin_and_have_zero_loss(self):
         model = make_model()
+        model.directional_loss_type = 'hinge'
         model.num_user = 2
         model.num_item = 2
         model.full_user_view = torch.zeros(2, 1, requires_grad=True)

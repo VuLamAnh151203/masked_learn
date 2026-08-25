@@ -44,6 +44,20 @@ class MASKED_GLORIA_DIRECTIONAL(MASKED_GLORIA):
                 256,
             )
         )
+        self.directional_permutation_gradient = str(
+            self._get_config_value(
+                config,
+                'directional_permutation_gradient',
+                'symmetric',
+            )
+        ).strip().lower()
+        self.directional_loss_type = str(
+            self._get_config_value(
+                config,
+                'directional_loss_type',
+                'softplus',
+            )
+        ).strip().lower()
 
         if self.directional_weight < 0.0:
             raise ValueError('directional_weight must be non-negative.')
@@ -68,6 +82,18 @@ class MASKED_GLORIA_DIRECTIONAL(MASKED_GLORIA):
             raise ValueError(
                 'directional_hard_pool_size must be at least '
                 'directional_num_negatives.'
+            )
+        if self.directional_permutation_gradient not in {
+            'symmetric',
+            'detached',
+        }:
+            raise ValueError(
+                'directional_permutation_gradient must be "symmetric" or '
+                '"detached".'
+            )
+        if self.directional_loss_type not in {'softplus', 'hinge'}:
+            raise ValueError(
+                'directional_loss_type must be "softplus" or "hinge".'
             )
 
         self.directional_seen_items = self._build_directional_seen_items()
@@ -147,7 +173,8 @@ class MASKED_GLORIA_DIRECTIONAL(MASKED_GLORIA):
             'mean_loss={:.8f}, mean_gap={:.8f}, positive_gap_rate={:.6f}, '
             'margin_rate={:.6f}, users={}, batches={}, candidates={}, '
             'negatives={}, permutations={}, temperature={}, margin={}, '
-            'weight={}, sampling={}, hard_pool={}'
+            'weight={}, sampling={}, hard_pool={}, permutation_gradient={}, '
+            'loss_type={}'
         ).format(
             mean_ranking_loss,
             mean_directional_loss,
@@ -164,6 +191,8 @@ class MASKED_GLORIA_DIRECTIONAL(MASKED_GLORIA):
             self.directional_weight,
             self.directional_negative_sampling,
             self.directional_hard_pool_size,
+            self.directional_permutation_gradient,
+            self.directional_loss_type,
         )
 
     def compute_result_embedding(self, forward_edge_mask=None, full_view=None):
@@ -420,10 +449,7 @@ class MASKED_GLORIA_DIRECTIONAL(MASKED_GLORIA):
             dim=1,
         )[:, 0]
 
-        # The permuted pairing is a moving reference, not an optimization
-        # target. no_grad is equivalent to detaching permuted_log_prob and
-        # avoids retaining its autograd graph.
-        with torch.no_grad():
+        def calculate_permuted_log_prob():
             permuted_masked_scores = torch.sum(
                 masked_users[permutation, None, :] * masked_items,
                 dim=-1,
@@ -431,15 +457,28 @@ class MASKED_GLORIA_DIRECTIONAL(MASKED_GLORIA):
             permuted_logits = (
                 full_scores + permuted_masked_scores
             ) / self.directional_temperature
-            permuted_log_prob = F.log_softmax(
+            return F.log_softmax(
                 permuted_logits,
                 dim=1,
             )[:, 0]
 
+        if self.directional_permutation_gradient == 'detached':
+            # Backward-compatible ablation: permutation only gates/reweights
+            # the original listwise gradient.
+            with torch.no_grad():
+                permuted_log_prob = calculate_permuted_log_prob()
+        else:
+            # Every permutation now provides its own optimization direction.
+            permuted_log_prob = calculate_permuted_log_prob()
+
         utility_gap = original_log_prob - permuted_log_prob
-        directional_loss = F.relu(
-            self.directional_margin - utility_gap
-        ).mean()
+        margin_violation = self.directional_margin - utility_gap
+        if self.directional_loss_type == 'hinge':
+            per_user_loss = F.relu(margin_violation)
+        else:
+            # Unlike hinge, softplus keeps a smooth gradient after the margin.
+            per_user_loss = F.softplus(margin_violation)
+        directional_loss = per_user_loss.mean()
         return directional_loss, utility_gap.detach()
 
     def calculate_directional_loss(self, interaction):

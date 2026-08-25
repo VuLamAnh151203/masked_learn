@@ -50,6 +50,12 @@ def parse_args(argv=None):
     parser.add_argument("--text-features", type=Path, default=DEFAULT_TEXT_FEATURES)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--num-negatives", type=int, default=32)
+    parser.add_argument(
+        "--negative-sampling",
+        choices=("random", "full_hard"),
+        default="random",
+    )
+    parser.add_argument("--hard-pool-size", type=int, default=256)
     parser.add_argument("--num-permutations", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=999)
@@ -69,11 +75,17 @@ def parse_args(argv=None):
         "knn_k",
         "knn_chunk_size",
         "histogram_bins",
+        "hard_pool_size",
     ):
         if getattr(args, name) <= 0:
             parser.error("--{} must be positive".format(name.replace("_", "-")))
     if args.temperature <= 0.0:
         parser.error("--temperature must be positive")
+    if (
+        args.negative_sampling == "full_hard"
+        and args.hard_pool_size < args.num_negatives
+    ):
+        parser.error("--hard-pool-size must be at least --num-negatives")
     return args
 
 
@@ -165,6 +177,63 @@ def sample_candidate_items(
                 if len(selected) == num_negatives:
                     break
         candidates[row, 1:] = selected
+    return candidates
+
+
+@torch.no_grad()
+def sample_full_hard_candidate_items(
+    embeddings,
+    user_ids,
+    positive_items,
+    known_items,
+    num_negatives,
+    pool_size,
+    score_batch_size,
+    rng,
+):
+    """Mine top Full-score negatives from a random unseen item pool."""
+    pool_candidates = sample_candidate_items(
+        user_ids,
+        positive_items,
+        known_items,
+        embeddings["num_items"],
+        pool_size,
+        rng,
+    )
+    negative_pool = pool_candidates[:, 1:]
+    device = embeddings["full_user"].device
+    hard_rows = []
+    for start in range(0, user_ids.size, score_batch_size):
+        end = min(start + score_batch_size, user_ids.size)
+        batch_users = torch.as_tensor(
+            user_ids[start:end], dtype=torch.long, device=device
+        )
+        batch_pool = torch.as_tensor(
+            negative_pool[start:end], dtype=torch.long, device=device
+        )
+        full_scores = torch.sum(
+            embeddings["full_user"][batch_users, None, :]
+            * embeddings["full_item"][batch_pool],
+            dim=-1,
+        )
+        hard_positions = torch.topk(
+            full_scores,
+            k=num_negatives,
+            dim=1,
+            largest=True,
+            sorted=True,
+        ).indices.cpu().numpy()
+        hard_rows.append(
+            np.take_along_axis(
+                negative_pool[start:end], hard_positions, axis=1
+            )
+        )
+
+    candidates = np.empty(
+        (user_ids.size, num_negatives + 1), dtype=np.int64
+    )
+    candidates[:, 0] = positive_items
+    candidates[:, 1:] = np.concatenate(hard_rows, axis=0)
     return candidates
 
 
@@ -408,14 +477,31 @@ def main(argv=None):
     known_items, train_degree = build_known_item_sets(
         split_rows, embeddings["num_users"]
     )
-    candidates = sample_candidate_items(
-        user_ids,
-        positive_items,
-        known_items,
-        embeddings["num_items"],
-        args.num_negatives,
-        rng,
-    )
+    if args.negative_sampling == "full_hard":
+        print(
+            "Mining {} Full-hard negatives from pools of {} items...".format(
+                args.num_negatives, args.hard_pool_size
+            )
+        )
+        candidates = sample_full_hard_candidate_items(
+            embeddings,
+            user_ids,
+            positive_items,
+            known_items,
+            args.num_negatives,
+            args.hard_pool_size,
+            args.score_batch_size,
+            rng,
+        )
+    else:
+        candidates = sample_candidate_items(
+            user_ids,
+            positive_items,
+            known_items,
+            embeddings["num_items"],
+            args.num_negatives,
+            rng,
+        )
     print(
         "Calculating listwise JSD for {:,} test users...".format(
             user_ids.size
@@ -466,6 +552,12 @@ def main(argv=None):
             ),
             "num_negatives": args.num_negatives,
             "candidate_count": args.num_negatives + 1,
+            "negative_sampling": args.negative_sampling,
+            "hard_pool_size": (
+                args.hard_pool_size
+                if args.negative_sampling == "full_hard"
+                else None
+            ),
             "num_mask_user_permutations": args.num_permutations,
             "permutation_has_no_fixed_points": True,
             "temperature": args.temperature,
