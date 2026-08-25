@@ -33,5 +33,5 @@ directional_margin: 0.1
 directional_num_negatives: 16
 directional_num_samples: 3
 directional_temperature: 0.5
-directional_negative_sampling: full_hard
+directional_negative_sampling: random
 directional_hard_pool_size: 256
