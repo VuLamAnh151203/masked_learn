@@ -28,7 +28,7 @@ branch_kl_weight: 0
 branch_kl_temperature: 1.0
 
 # MASKED_GLORIA_DIRECTIONAL label-aware permutation experiment.
-directional_weight: 0.003
+directional_weight: 0.01
 directional_margin: 0.1
 directional_num_negatives: 16
 directional_num_samples: 3
