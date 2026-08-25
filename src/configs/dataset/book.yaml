@@ -20,6 +20,8 @@ mipd_weight: 0.01
 mipd_num_negatives: 32
 mipd_num_samples: 3
 mipd_temperature: 1.0
+mipd_negative_sampling: full_hard
+mipd_hard_pool_size: 256
 
 # MASKED_GLORIA_MIPD_KL Full-Masked distribution alignment.
 branch_kl_weight: 0

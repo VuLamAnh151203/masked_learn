@@ -48,6 +48,8 @@ def make_model():
     model.mipd_num_samples = 1
     model.mipd_num_negatives = 2
     model.mipd_temperature = 0.7
+    model.mipd_negative_sampling = 'random'
+    model.mipd_hard_pool_size = 4
     model.full_user_view = torch.tensor(
         [[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
         requires_grad=True,
@@ -172,6 +174,34 @@ class ListwiseMipdTest(unittest.TestCase):
                 set(negatives).isdisjoint(model.mipd_seen_items[user_id])
             )
             self.assertNotIn(row[0], negatives)
+
+    def test_full_hard_mode_selects_highest_full_score_unseen_items(self):
+        model = make_model()
+        model.mipd_negative_sampling = 'full_hard'
+        model.mipd_hard_pool_size = 6
+        # Each of these users has exactly four unseen items, so the random pool
+        # contains the complete eligible set before Full-score top-k selection.
+        interaction = torch.tensor(
+            [
+                [0, 1],
+                [0, 2],
+                [3, 4],
+            ]
+        )
+
+        torch.manual_seed(17)
+        users, candidates = model._build_mipd_candidates(interaction)
+
+        self.assertEqual(users.tolist(), [0, 1])
+        # User 0: unseen {2,3,4,5}; Full scores {1,-1,.4,.3}.
+        # User 1: unseen {0,1,4,5}; Full scores {0,1,-.8,.6}.
+        self.assertEqual(candidates.tolist(), [[0, 2, 4], [2, 1, 5]])
+        for user_id, row in zip(users.tolist(), candidates.tolist()):
+            negatives = row[1:]
+            self.assertEqual(len(negatives), len(set(negatives)))
+            self.assertTrue(
+                set(negatives).isdisjoint(model.mipd_seen_items[user_id])
+            )
 
     def test_derangement_has_no_fixed_points(self):
         torch.manual_seed(7)

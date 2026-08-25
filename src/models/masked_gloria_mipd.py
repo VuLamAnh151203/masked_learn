@@ -57,6 +57,16 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         self.mipd_temperature = float(
             self._get_config_value(config, 'mipd_temperature', 1.0)
         )
+        self.mipd_negative_sampling = str(
+            self._get_config_value(
+                config,
+                'mipd_negative_sampling',
+                'random'
+            )
+        ).strip().lower().replace('-', '_')
+        self.mipd_hard_pool_size = int(
+            self._get_config_value(config, 'mipd_hard_pool_size', 256)
+        )
         if self.mipd_weight < 0.0:
             raise ValueError('mipd_weight must be non-negative.')
         if self.mipd_num_samples < 1:
@@ -67,6 +77,17 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             )
         if self.mipd_temperature <= 0.0:
             raise ValueError('mipd_temperature must be positive.')
+        if self.mipd_negative_sampling not in {'random', 'full_hard'}:
+            raise ValueError(
+                'mipd_negative_sampling must be "random" or "full_hard".'
+            )
+        if (
+            self.mipd_negative_sampling == 'full_hard'
+            and self.mipd_hard_pool_size < self.mipd_num_negatives
+        ):
+            raise ValueError(
+                'mipd_hard_pool_size must be at least mipd_num_negatives.'
+            )
 
         # Latest detached values are useful for logging without changing the
         # calculate_loss return type expected by the existing trainer.
@@ -251,7 +272,7 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
         return (
             'listwise MIPD: mean_jsd={:.8f}, users={}, batches={}, '
             'candidates={}, negatives={}, permutations={}, temperature={}, '
-            'weight={}'
+            'weight={}, sampling={}, hard_pool={}'
         ).format(
             mean_jsd,
             self.mipd_epoch_user_count,
@@ -260,7 +281,9 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             self.mipd_num_negatives,
             self.mipd_num_samples,
             self.mipd_temperature,
-            self.mipd_weight
+            self.mipd_weight,
+            self.mipd_negative_sampling,
+            self.mipd_hard_pool_size
         )
 
 
@@ -497,6 +520,12 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             empty = positive_items.new_empty((0, negative_count + 1))
             return user_nodes, empty
 
+        if self.mipd_negative_sampling == 'full_hard':
+            return user_nodes, self._build_full_hard_mipd_candidates(
+                user_nodes,
+                positive_items,
+            )
+
         # Oversample once for the entire mini-batch, then filter histories and
         # duplicates on CPU. This costs one device synchronization, not one per
         # user. A deterministic scan handles the rare insufficient row.
@@ -565,6 +594,121 @@ class MASKED_GLORIA_MIPD(GeneralRecommender):
             candidate_rows,
             dtype=torch.long,
             device=user_nodes.device
+        )
+
+    def _build_full_hard_mipd_candidates(
+        self,
+        user_nodes,
+        positive_items,
+    ):
+        """Select MIPD negatives with the highest detached Full score."""
+        batch_size = int(user_nodes.numel())
+        negative_count = int(self.mipd_num_negatives)
+        pool_size = int(self.mipd_hard_pool_size)
+
+        # Draw more IDs than needed, then remove histories and duplicates on
+        # CPU. A deterministic scan fills rare rows with too few random hits.
+        draw_count = max(pool_size * 3, pool_size + 32)
+        random_pool = torch.randint(
+            self.num_item,
+            (batch_size, draw_count),
+            device=user_nodes.device,
+        ).cpu().numpy()
+        users_cpu = user_nodes.detach().cpu().tolist()
+        positives_cpu = positive_items.detach().cpu().tolist()
+
+        pool_rows = []
+        valid_lengths = []
+        for row, (user_id, positive_id) in enumerate(
+            zip(users_cpu, positives_cpu)
+        ):
+            user_id = int(user_id)
+            positive_id = int(positive_id)
+            excluded = set(self.mipd_seen_items[user_id])
+            excluded.add(positive_id)
+            available_count = self.num_item - len(excluded)
+            if available_count < negative_count:
+                raise ValueError(
+                    'User {} has only {} unseen items, but MIPD needs {}.'
+                    .format(user_id, available_count, negative_count)
+                )
+
+            target_pool_size = min(pool_size, available_count)
+            selected = []
+            selected_set = set()
+
+            def add_pool_item(item_id):
+                item_id = int(item_id)
+                if (
+                    item_id < 0
+                    or item_id >= self.num_item
+                    or item_id in excluded
+                    or item_id in selected_set
+                ):
+                    return
+                selected.append(item_id)
+                selected_set.add(item_id)
+
+            for item_id in random_pool[row]:
+                add_pool_item(item_id)
+                if len(selected) == target_pool_size:
+                    break
+
+            if len(selected) < target_pool_size:
+                start = int(random_pool[row, 0])
+                for offset in range(self.num_item):
+                    add_pool_item((start + offset) % self.num_item)
+                    if len(selected) == target_pool_size:
+                        break
+
+            valid_lengths.append(len(selected))
+            # Pad only for batched scoring. Padded positions are masked to
+            # -inf and can never be selected by top-k.
+            selected.extend([selected[0]] * (pool_size - len(selected)))
+            pool_rows.append(selected)
+
+        pool_items = torch.as_tensor(
+            pool_rows,
+            dtype=torch.long,
+            device=user_nodes.device,
+        )
+        valid_lengths = torch.as_tensor(
+            valid_lengths,
+            dtype=torch.long,
+            device=user_nodes.device,
+        )
+        valid_mask = (
+            torch.arange(pool_size, device=user_nodes.device)[None, :]
+            < valid_lengths[:, None]
+        )
+
+        # Mining is a discrete conditioning step. Detaching Full prevents the
+        # selector from changing the Full branch and leaves MIPD gradients for
+        # the Masked branch, matching calculate_listwise_mipd().
+        with torch.no_grad():
+            full_users = self.full_user_view[user_nodes]
+            full_items = self.full_item_view[pool_items]
+            full_scores = torch.sum(
+                full_users[:, None, :] * full_items,
+                dim=-1,
+            )
+            full_scores = full_scores.masked_fill(~valid_mask, float('-inf'))
+            hard_positions = torch.topk(
+                full_scores,
+                k=negative_count,
+                dim=1,
+                largest=True,
+                sorted=True,
+            ).indices
+            hard_negatives = torch.gather(
+                pool_items,
+                dim=1,
+                index=hard_positions,
+            )
+
+        return torch.cat(
+            [positive_items[:, None], hard_negatives],
+            dim=1,
         )
 
     @staticmethod
