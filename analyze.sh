@@ -1,0 +1,13 @@
+python src/analyze_original_checkpoint_branch_cases.py \
+  --checkpoint saved/MASKED_GLORIA-book-seed999-Aug-12-2026-13-46-25.pth \
+  --splits validation test \
+  --cutoffs 5 10 20 \
+  --device cuda:0 \
+  --score-batch-size 256 \
+  --knn-k 10 \
+  --knn-chunk-size 1024 \
+  --directional-num-negatives 16 \
+  --directional-num-permutations 3 \
+  --directional-temperature 0.5 \
+  --bootstrap-samples 1000 \
+  --seed 999
